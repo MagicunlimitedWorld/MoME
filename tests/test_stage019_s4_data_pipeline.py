@@ -80,6 +80,17 @@ def test_validation_beam4_rejects_clean_or_unlocked_annotation(
     )
 
 
+def test_extract_worker_accepts_collated_tensor_and_basepoints_wrapper() -> None:
+    points = torch.tensor([[1.0, 2.0, 3.0, 0.5], [4.0, 5.0, 6.0, 0.7]])
+    expected = points[:, :3].numpy()
+    np.testing.assert_array_equal(extract_worker._points_xyz(points), expected)
+    np.testing.assert_array_equal(
+        extract_worker._points_xyz(Namespace(tensor=points)), expected
+    )
+    with pytest.raises(ValueError, match="shape"):
+        extract_worker._points_xyz(torch.ones(2, 2))
+
+
 def test_one_to_one_quality_does_not_label_duplicate_or_far_anchor() -> None:
     boxes = _boxes([(0.0, 0.0), (0.1, 0.0), (70.0, 0.0)])
     labels = np.zeros(3, dtype=np.int64)

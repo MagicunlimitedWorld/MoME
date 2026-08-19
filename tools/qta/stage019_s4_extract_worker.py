@@ -126,6 +126,16 @@ def _atomic_savez(path: Path, **arrays: np.ndarray) -> None:
             os.unlink(temporary)
 
 
+def _points_xyz(points: Any) -> np.ndarray:
+    """Normalize the post-collate point representation without changing values."""
+    tensor = getattr(points, "tensor", points)
+    if not all(hasattr(tensor, name) for name in ("ndim", "shape", "detach")):
+        raise TypeError("S4 point input must be a tensor or expose .tensor")
+    if int(tensor.ndim) != 2 or int(tensor.shape[1]) < 3:
+        raise ValueError("S4 point input must have shape [N, >=3]")
+    return tensor[:, :3].detach().cpu().numpy()
+
+
 def _gpu_identity(args: argparse.Namespace) -> dict[str, Any]:
     visible = os.environ.get("CUDA_VISIBLE_DEVICES")
     if visible != args.expected_cvd:
@@ -672,7 +682,7 @@ def main() -> int:
                         role: _bbox_arrays(bundle["expert_bboxes"][role][0])
                         for role in EXPERT_ROLES
                     }
-                    points_xyz = batch["points"][0].tensor[:, :3].detach().cpu().numpy()
+                    points_xyz = _points_xyz(batch["points"][0])
                     gt_boxes = batch["gt_bboxes_3d"][0].tensor.detach().cpu().numpy()
                     gt_labels = batch["gt_labels_3d"][0].detach().cpu().numpy()
                     record = build_leakage_separated_cache_record(
