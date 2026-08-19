@@ -322,7 +322,7 @@ def test_g0_gate_writes_outer_manifest_schema(tmp_path: Path, monkeypatch) -> No
             },
         }
         path = tmp_path / f"{condition}.json"
-        path.write_text(json.dumps(payload), encoding="utf-8")
+        path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
         manifests.append(path)
     artifact = tmp_path / "artifact"
     output = artifact / "gate"
@@ -335,6 +335,22 @@ def test_g0_gate_writes_outer_manifest_schema(tmp_path: Path, monkeypatch) -> No
     result = json.loads((output / "stage019_s4_g0_gate_manifest.json").read_text())
     assert result["schema"] == "visfuse3d_stage019_s4_g0_gate_manifest_v1"
     assert result["training_authorized"] and result["g1_authorized"]
+
+    first_payload = json.loads(manifests[0].read_text(encoding="utf-8"))
+    union_metrics = first_payload["metrics"].pop("g0_union")
+    manifests[0].write_text(
+        json.dumps(first_payload, sort_keys=True), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="invalid G0 condition manifest"):
+        g0_gate._load_conditions(manifests)
+
+    first_payload["metrics"]["g0_union"] = union_metrics
+    first_payload["metrics"]["unexpected_role"] = union_metrics
+    manifests[0].write_text(
+        json.dumps(first_payload, sort_keys=True), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="invalid G0 condition manifest"):
+        g0_gate._load_conditions(manifests)
 
 
 def test_validation_gate_requires_both_changed_and_accepted_and_real_zero_sha(

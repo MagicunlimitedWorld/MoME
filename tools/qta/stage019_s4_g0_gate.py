@@ -81,7 +81,7 @@ def _load_conditions(paths: list[Path]) -> dict[str, dict]:
             or int(payload.get("frame_count", -1)) != G0_FRAME_COUNT
             or int(payload.get("unique_token_count", -1)) != G0_FRAME_COUNT
             or int(payload.get("engineering_failure_count", -1)) != 0
-            or tuple(metrics) != ROLES
+            or set(metrics) != set(ROLES)
             or len(folds) != 3
             or tuple(int(value.get("scene_count", -1)) for value in folds)
             != G0_FOLD_SIZES
@@ -93,7 +93,7 @@ def _load_conditions(paths: list[Path]) -> dict[str, dict]:
                 value = float(metrics[role][metric])
                 if not -1.0 <= value <= 1.0:
                     raise ValueError(f"invalid G0 metric {condition}/{role}/{metric}")
-        if any(tuple(fold.get("metrics", {})) != ROLES for fold in folds):
+        if any(set(fold.get("metrics", {})) != set(ROLES) for fold in folds):
             raise ValueError("G0 fold role schema drifted")
         identity = payload.get("locked_worker_identity", {})
         current_common = {
