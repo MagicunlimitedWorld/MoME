@@ -150,7 +150,7 @@ def _prediction_sha256(result: dict) -> str:
 
 
 def _validate_s3_hard_bypass_input(
-    args: argparse.Namespace, batch: dict, torch
+    args: argparse.Namespace, batch: dict, model, torch
 ) -> dict:
     meta = batch["img_metas"][0]
     if meta.get("qta_hard_bypass") is not True:
@@ -164,7 +164,9 @@ def _validate_s3_hard_bypass_input(
     if args.condition == "lidar_zero":
         exact_zero = int(torch.count_nonzero(batch["points"][0]).item()) == 0
     else:
-        exact_zero = int(torch.count_nonzero(batch["img"]).item()) == 0
+        exact_zero = bool(
+            model._camera_sample_is_zero(batch["img"], batch["img_metas"][0])
+        )
     if not exact_zero:
         raise RuntimeError("complete-zero smoke input is not exactly zero")
     return {
@@ -322,9 +324,6 @@ def main() -> int:
         args.protocol_profile == S3_PROTOCOL_PROFILE
         and args.condition in S3_HARD_BYPASS_CONDITIONS
     )
-    if is_s3_hard_bypass:
-        hard_bypass_input = _validate_s3_hard_bypass_input(args, batch, torch)
-
     if args.margins is not None:
         args.mode = "s2a"
         _, s2a_margins = _load_locked_margins(args)
@@ -356,6 +355,12 @@ def main() -> int:
             ],
             return_predictions=True,
         )
+        if is_s3_hard_bypass:
+            # MoME detects complete-modality zeros at extract_feat entry and
+            # annotates the transient runtime constraints on img_metas.
+            hard_bypass_input = _validate_s3_hard_bypass_input(
+                args, batch, model, torch
+            )
         s2b = None
         if not is_s3_hard_bypass:
             active["name"] = "s2b"
