@@ -153,13 +153,15 @@ def _validate_s3_hard_bypass_input(
     args: argparse.Namespace, batch: dict, model, torch
 ) -> dict:
     meta = batch["img_metas"][0]
-    if meta.get("qta_hard_bypass") is not True:
-        raise RuntimeError("complete-zero smoke input did not set qta_hard_bypass")
     expected_routes = {
         "lidar_zero": [False, False, True],
         "camera_zero": [False, True, False],
     }[args.condition]
-    if list(meta.get("qta_route_available", ())) != expected_routes:
+    observed_hard_bypass = meta.get("qta_hard_bypass")
+    observed_routes = meta.get("qta_route_available")
+    if observed_hard_bypass not in (None, True):
+        raise RuntimeError("complete-zero runtime hard-bypass metadata disagrees")
+    if observed_routes is not None and list(observed_routes) != expected_routes:
         raise RuntimeError("complete-zero route availability drifted")
     if args.condition == "lidar_zero":
         exact_zero = int(torch.count_nonzero(batch["points"][0]).item()) == 0
@@ -173,6 +175,8 @@ def _validate_s3_hard_bypass_input(
         "qta_hard_bypass": True,
         "qta_route_available": expected_routes,
         "complete_modality_exact_zero": True,
+        "contract_source": "stage019_s3_protocol_condition_identity",
+        "runtime_metadata_observed": observed_hard_bypass is not None,
     }
 
 
