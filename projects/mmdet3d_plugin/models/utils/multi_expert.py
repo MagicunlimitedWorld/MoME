@@ -20,6 +20,12 @@ from mmdet.models.utils.builder import TRANSFORMER
 import matplotlib.pyplot as plt
 import cv2
 
+from .qta_router import (
+    QueryTaskAdvantageRouter,
+    normalize_route_override,
+    output_query_indices_from_masks,
+)
+
 @TRANSFORMER.register_module()
 class MultiExpert(BaseModule):
     def __init__(
@@ -29,6 +35,7 @@ class MultiExpert(BaseModule):
             window_sizes=[15,5],
             encoder=None,
             decoder=None,
+            qta_router=None,
             init_cfg=None
     ):
         super(MultiExpert, self).__init__(init_cfg=init_cfg)
@@ -38,6 +45,14 @@ class MultiExpert(BaseModule):
             self.selected_cls = nn.Linear(256, 3)
         else:
             self.encoder = None
+        if qta_router is not None:
+            qta_cfg = copy.deepcopy(qta_router)
+            qta_type = qta_cfg.pop('type', 'QueryTaskAdvantageRouter')
+            if qta_type != 'QueryTaskAdvantageRouter':
+                raise ValueError(f'Unsupported qta_router type: {qta_type}')
+            self.qta_router = QueryTaskAdvantageRouter(**qta_cfg)
+        else:
+            self.qta_router = None
         self.decoder = build_transformer_layer_sequence(decoder)
         self.embed_dims = self.decoder.embed_dims
         self.use_type_embed = use_type_embed
@@ -67,6 +82,8 @@ class MultiExpert(BaseModule):
         for m in self.modules():
             if hasattr(m, 'weight') and m.weight.dim() > 1:
                 xavier_init(m, distribution='uniform')
+        if self.qta_router is not None:
+            self.qta_router.load_advantage_checkpoint()
         self._is_init = True
 
     def AQR_with_LAM(self, ca_dict, ref_points, pc_range, x_img, img_metas, reg_branch=None):
@@ -251,7 +268,8 @@ class MultiExpert(BaseModule):
             target = target[-1].transpose(1,0)
         batch_size,_num_queries, num_dims = target.shape
         #  target = target.reshape(-1, num_dims)
-        target = self.selected_cls(target)
+        router_features = target
+        target = self.selected_cls(router_features)
         if self.training:
             weight_f_target = torch.tensor([i['modalmask'] for i in img_metas]).cuda()
             weight_f_target_expanded = weight_f_target.unsqueeze(1).repeat(1,_num_queries,1)
@@ -262,10 +280,26 @@ class MultiExpert(BaseModule):
             loss_weight_f = self._criterion(target_r, weight_f_target_expanded.float())
         else:
             loss_weight_f = False
-        return target, loss_weight_f, _
+        return target, loss_weight_f, router_features
+
+    @staticmethod
+    def _qta_runtime_constraints(img_metas, device):
+        route_available = torch.tensor(
+            [meta.get('qta_route_available', [True, True, True]) for meta in img_metas],
+            device=device,
+            dtype=torch.bool,
+        )
+        hard_bypass = torch.tensor(
+            [bool(meta.get('qta_hard_bypass', False)) for meta in img_metas],
+            device=device,
+            dtype=torch.bool,
+        )
+        return route_available, hard_bypass
 
     def forward(self, x, x_img, bev_query_embed, rv_query_embed, bev_pos_embed, rv_pos_embed, img_metas,
-                attn_masks=None, modalities=None, reg_branch=None, ref_points=None, pc_range=None):
+                attn_masks=None, modalities=None, reg_branch=None, ref_points=None, pc_range=None,
+                route_override=None, qta_thresholds=None, qta_max_overrides=None,
+                return_router_state=False):
         bs, c, h, w = x.shape
         bev_memory = rearrange(x, "bs c h w -> (h w) bs c")  # [bs, n, c, h, w] -> [n*h*w, bs, c]
         rv_memory = rearrange(x_img, "(bs v) c h w -> (v h w) bs c", bs=bs)
@@ -298,10 +332,32 @@ class MultiExpert(BaseModule):
         ca_dict_fp['memory_v_l'].append(memory_v)
         ca_dict_fp['query_embed_l'].append(query_embed)
         ca_dict_fp['pos_embed_l'].append(pos_embed)
-        qmod_sel, qmod_sel_loss, filt = self.AQR_with_LAM(ca_dict_fp, ref_points, pc_range, x_img, img_metas,
-                                                                   reg_branch=reg_branch)
-        
-        q_sel = qmod_sel.max(-1)[1]
+        qmod_sel, qmod_sel_loss, router_features = self.AQR_with_LAM(
+            ca_dict_fp, ref_points, pc_range, x_img, img_metas, reg_branch=reg_branch
+        )
+
+        base_routes = qmod_sel.max(-1)[1]
+        q_sel = base_routes
+        advantage_scores = None
+        qta_override_mask = torch.zeros_like(base_routes, dtype=torch.bool)
+        if self.qta_router is not None:
+            route_available, hard_bypass = self._qta_runtime_constraints(
+                img_metas, base_routes.device
+            )
+            qta_output = self.qta_router(
+                router_features=router_features,
+                base_routes=base_routes,
+                route_available=route_available,
+                hard_bypass=hard_bypass,
+                thresholds=qta_thresholds,
+                max_overrides_per_frame=qta_max_overrides,
+            )
+            advantage_scores = qta_output['advantage_scores']
+            q_sel = qta_output['final_routes']
+            qta_override_mask = qta_output['override_mask']
+        if route_override is not None:
+            q_sel = normalize_route_override(route_override, base_routes)
+            qta_override_mask = q_sel != base_routes
         for idx, modality in enumerate(modalities):
             if modality == "fused":
                 memory, pos_embed = (torch.cat([bev_memory, rv_memory], dim=0),
@@ -358,4 +414,16 @@ class MultiExpert(BaseModule):
             ca_dict['pos_embed_l'].append(pos_embed.clone())
             ca_dict['zero_idx'].append(zero_idx.clone())
         ca_dict['qmod_sel_loss'] = qmod_sel_loss
+        ca_dict['base_routes'] = base_routes
+        ca_dict['final_routes'] = q_sel
+        ca_dict['qta_override_mask'] = qta_override_mask
+        if advantage_scores is not None:
+            ca_dict['advantage_scores'] = advantage_scores
+        if return_router_state:
+            ca_dict['router_features'] = router_features
+            ca_dict['reference_points'] = ref_points
+            if not self.training:
+                ca_dict['output_query_indices'] = output_query_indices_from_masks(
+                    ca_dict['zero_idx'], q_sel.shape[1]
+                )
         return out_decs, ca_dict

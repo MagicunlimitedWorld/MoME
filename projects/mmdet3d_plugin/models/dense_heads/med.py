@@ -21,8 +21,21 @@ from mmdet.models.utils.transformer import inverse_sigmoid
 from mmdet3d.models import builder
 from torch.nn import functional as F
 from projects.mmdet3d_plugin.core.bbox.util import normalize_bbox
+from projects.mmdet3d_plugin.models.utils.qta_router import (
+    output_query_indices_from_masks,
+    reorder_query_tensor_to_original,
+    route_assignment_masks,
+    validate_complete_query_permutation,
+)
 import matplotlib.pyplot as plt
 import os
+
+
+FINAL_DETECTION_HEAD_FIELDS = (
+    'cls_logits', 'center', 'height', 'dim', 'rot', 'vel'
+)
+
+
 def pos2embed(pos, num_pos_feats=128, temperature=10000):
     scale = 2 * math.pi
     pos = pos * scale
@@ -321,7 +334,28 @@ class MultiExpertDecoding(BaseModule):
         rv_embeds = self._rv_query_embed(ref_points, img_metas)
         return bev_embeds, rv_embeds
 
-    def forward_single(self, x, x_img, img_metas, points):
+    @staticmethod
+    def _exact_route_assignment_diagnostics(ca_dict, outs_dec):
+        """Synchronize route masks and query ids without inspecting hidden values."""
+
+        decoder_layer_counts = {int(item.shape[0]) for item in outs_dec}
+        if len(decoder_layer_counts) != 1:
+            raise RuntimeError(
+                'route-state diagnostics require equal decoder layer counts'
+            )
+        route_masks = route_assignment_masks(
+            ca_dict['final_routes'],
+            decoder_layer_counts.pop(),
+            num_routes=len(outs_dec),
+        )
+        query_indices = output_query_indices_from_masks(
+            route_masks, ca_dict['final_routes'].shape[1]
+        )
+        return route_masks, query_indices
+
+    def forward_single(self, x, x_img, img_metas, points, route_override=None,
+                       qta_thresholds=None, qta_max_overrides=None,
+                       return_router_state=False):
         """
             x: [bs c h w]
             return List(dict(head_name: [num_dec x bs x num_query * head_dim]) ) x task_num
@@ -342,7 +376,17 @@ class MultiExpertDecoding(BaseModule):
         outs_dec, ca_dict = self.transformer(
             x, x_img, bev_query_embeds, rv_query_embeds, bev_pos_embeds, rv_pos_embeds, img_metas,
             attn_masks=attn_mask, modalities=modalities, ref_points=reference_points, pc_range=self.pc_range,
+            route_override=route_override, qta_thresholds=qta_thresholds,
+            qta_max_overrides=qta_max_overrides,
+            return_router_state=return_router_state,
         )
+        if return_router_state and not self.training:
+            (
+                ca_dict['zero_idx'],
+                ca_dict['output_query_indices'],
+            ) = self._exact_route_assignment_diagnostics(
+                ca_dict, outs_dec
+            )
         num_queries_per_modality = [m.shape[2] for m in outs_dec]
         outs_dec = torch.cat(outs_dec, dim=2)
         if 'zero_idx' in ca_dict and not self.training:
@@ -499,14 +543,43 @@ class MultiExpertDecoding(BaseModule):
             ret_dicts.append(outs)
         if 'qmod_sel_loss' in ca_dict:
             outs['qmod_sel_loss'] = ca_dict['qmod_sel_loss']
+        expose_routes = (
+            return_router_state
+            or route_override is not None
+            or getattr(self.transformer, 'qta_router', None) is not None
+        )
+        if expose_routes:
+            diagnostic_keys = [
+                'base_routes', 'advantage_scores', 'final_routes', 'qta_override_mask'
+            ]
+            if return_router_state:
+                diagnostic_keys.extend(
+                    ['router_features', 'reference_points', 'output_query_indices']
+                )
+            for task_out in ret_dicts:
+                for key in diagnostic_keys:
+                    if key in ca_dict:
+                        task_out[key] = ca_dict[key]
         return ret_dicts
 
-    def forward(self, pts_feats, img_feats=None, img_metas=None, points=[None]):
+    def forward(self, pts_feats, img_feats=None, img_metas=None, points=[None],
+                route_override=None, qta_thresholds=None, qta_max_overrides=None,
+                return_router_state=False):
         """
             list([bs, c, h, w])
         """
         img_metas = [img_metas for _ in range(len(pts_feats))]
-        return multi_apply(self.forward_single, pts_feats, img_feats, img_metas, points)
+        return multi_apply(
+            self.forward_single,
+            pts_feats,
+            img_feats,
+            img_metas,
+            points,
+            route_override=route_override,
+            qta_thresholds=qta_thresholds,
+            qta_max_overrides=qta_max_overrides,
+            return_router_state=return_router_state,
+        )
 
     def _get_targets_single(self, gt_bboxes_3d, gt_labels_3d, pred_bboxes, pred_logits):
         """"Compute regression and classification targets for one image.
@@ -620,6 +693,447 @@ class MultiExpertDecoding(BaseModule):
 
         return (task_labels_list, task_labels_weight_list, task_bbox_targets_list,
                 task_bbox_weights_list, num_total_pos_tasks, num_total_neg_tasks)
+
+    @staticmethod
+    def _select_prediction_tensor(value, route_index=0):
+        if isinstance(value, list):
+            value = value[route_index]
+        return value[-1]
+
+    def final_task_predictions(self, preds_dicts, route_index=0):
+        """Extract final-decoder predictions for fixed-target QTA comparison."""
+
+        pred_bboxes = []
+        pred_logits = []
+        for task_levels in preds_dicts:
+            task = task_levels[0]
+            bbox_parts = [
+                self._select_prediction_tensor(task['center'], route_index),
+                self._select_prediction_tensor(task['height'], route_index),
+                self._select_prediction_tensor(task['dim'], route_index),
+                self._select_prediction_tensor(task['rot'], route_index),
+            ]
+            if 'vel' in task:
+                bbox_parts.append(self._select_prediction_tensor(task['vel'], route_index))
+            pred_bboxes.append(torch.cat(bbox_parts, dim=-1))
+            pred_logits.append(
+                self._select_prediction_tensor(task['cls_logits'], route_index)
+            )
+        return pred_bboxes, pred_logits
+
+    def validate_s2_prediction_bundle(self, preds_dicts, label,
+                                      expected_query_count=None):
+        """Validate query identity and all final detection-head source fields."""
+
+        if not preds_dicts or not preds_dicts[0]:
+            raise RuntimeError(f'{label} contains no prediction tasks')
+        first_task = preds_dicts[0][0]
+        if 'output_query_indices' not in first_task:
+            raise RuntimeError(f'{label} lacks output_query_indices')
+        query_indices = first_task['output_query_indices']
+        query_count = (
+            int(expected_query_count)
+            if expected_query_count is not None
+            else int(query_indices.shape[1])
+        )
+        query_indices = validate_complete_query_permutation(
+            query_indices, query_count, label=f'{label}.output_query_indices'
+        )
+        for level_index, level_tasks in enumerate(preds_dicts):
+            for task_index, task in enumerate(level_tasks):
+                observed_indices = task.get('output_query_indices')
+                if observed_indices is None or not torch.equal(
+                    observed_indices.long(), query_indices
+                ):
+                    raise RuntimeError(
+                        f'{label} task {level_index}:{task_index} query ids drifted'
+                    )
+                for field in FINAL_DETECTION_HEAD_FIELDS:
+                    if field not in task:
+                        raise RuntimeError(
+                            f'{label} task {level_index}:{task_index} lacks {field}'
+                        )
+                    value = task[field]
+                    if isinstance(value, list):
+                        raise RuntimeError(
+                            f'{label}.{field} must be the eval tensor, not a route list'
+                        )
+                    if not torch.is_tensor(value) or value.ndim != 4:
+                        raise RuntimeError(
+                            f'{label}.{field} must have shape [D,B,N,C]'
+                        )
+                    final_value = value[-1]
+                    if final_value.shape[:2] != query_indices.shape:
+                        raise RuntimeError(
+                            f'{label}.{field} does not align with query identities'
+                        )
+                    if not torch.isfinite(final_value).all():
+                        raise RuntimeError(
+                            f'{label}.{field} contains non-finite final predictions'
+                        )
+        return query_indices
+
+    @staticmethod
+    def _inverse_query_permutation(query_indices):
+        inverse = torch.empty_like(query_indices, dtype=torch.long)
+        positions = torch.arange(
+            query_indices.shape[1], device=query_indices.device,
+            dtype=torch.long).unsqueeze(0).expand_as(inverse)
+        inverse.scatter_(1, query_indices.long(), positions)
+        return inverse
+
+    def reorder_query_targets_by_identity(
+        self,
+        target_bundle,
+        source_query_indices,
+        destination_query_indices,
+    ):
+        """Align a frozen Hungarian target bundle to another output ordering."""
+
+        query_count = int(source_query_indices.shape[1])
+        source = validate_complete_query_permutation(
+            source_query_indices, query_count, label='target_source_query_indices'
+        )
+        destination = validate_complete_query_permutation(
+            destination_query_indices,
+            query_count,
+            label='target_destination_query_indices',
+        )
+        if source.shape != destination.shape:
+            raise RuntimeError('target source/destination batch shapes differ')
+        source_position = self._inverse_query_permutation(source)
+        output = dict(target_bundle)
+        for key in ('labels', 'label_weights', 'bbox_targets', 'bbox_weights'):
+            reordered_tasks = []
+            for task_items in target_bundle[key]:
+                if len(task_items) != source.shape[0]:
+                    raise RuntimeError(f'{key} batch size differs from query ids')
+                reordered_batch = []
+                for batch_index, tensor in enumerate(task_items):
+                    positions = source_position[batch_index].index_select(
+                        0, destination[batch_index]
+                    )
+                    reordered_batch.append(tensor.index_select(0, positions))
+                reordered_tasks.append(reordered_batch)
+            output[key] = reordered_tasks
+        return output
+
+    def query_losses_in_original_order(
+        self,
+        preds_dicts,
+        target_bundle,
+        target_query_indices,
+        prediction_query_indices,
+    ):
+        """Apply one frozen matching and return losses indexed by original id."""
+
+        aligned_targets = self.reorder_query_targets_by_identity(
+            target_bundle,
+            target_query_indices,
+            prediction_query_indices,
+        )
+        losses = self.query_losses_from_targets(preds_dicts, aligned_targets)
+        return {
+            key: reorder_query_tensor_to_original(value, prediction_query_indices)
+            for key, value in losses.items()
+        }
+
+    def compose_final_detection_head_outputs(
+        self,
+        anchor_preds,
+        source_preds,
+        source_routes,
+        label='s2_composed_output',
+    ):
+        """Copy only six final-layer head fields by original query identity.
+
+        ``source_routes`` is indexed by original query id. ``-1`` keeps the
+        anchor field; 0/1/2 copy Fused/LiDAR/Camera respectively.
+        """
+
+        if len(source_preds) != 3:
+            raise ValueError('source_preds must contain Fused, LiDAR and Camera')
+        anchor_indices = self.validate_s2_prediction_bundle(
+            anchor_preds, f'{label}.anchor', expected_query_count=self.num_query
+        )
+        source_indices = [
+            self.validate_s2_prediction_bundle(
+                predictions,
+                f'{label}.source_{route_index}',
+                expected_query_count=self.num_query,
+            )
+            for route_index, predictions in enumerate(source_preds)
+        ]
+        if source_routes.shape != anchor_indices.shape:
+            raise ValueError('source_routes must have shape [B,N]')
+        if torch.any((source_routes < -1) | (source_routes >= 3)):
+            raise ValueError('source_routes values must be KEEP=-1 or 0/1/2')
+        source_routes = source_routes.to(
+            device=anchor_indices.device, dtype=torch.long
+        )
+        anchor_position = self._inverse_query_permutation(anchor_indices)
+        source_positions = [
+            self._inverse_query_permutation(indices) for indices in source_indices
+        ]
+
+        output_levels = []
+        for level_index, anchor_tasks in enumerate(anchor_preds):
+            output_tasks = []
+            for task_index, anchor_task in enumerate(anchor_tasks):
+                output_task = dict(anchor_task)
+                for field in FINAL_DETECTION_HEAD_FIELDS:
+                    composed = anchor_task[field].clone()
+                    for batch_index in range(source_routes.shape[0]):
+                        for route_index in range(3):
+                            original_ids = torch.nonzero(
+                                source_routes[batch_index] == route_index,
+                                as_tuple=False,
+                            ).flatten()
+                            if original_ids.numel() == 0:
+                                continue
+                            destination_positions = anchor_position[
+                                batch_index
+                            ].index_select(0, original_ids)
+                            source_query_positions = source_positions[
+                                route_index
+                            ][batch_index].index_select(0, original_ids)
+                            source_value = source_preds[route_index][level_index][
+                                task_index
+                            ][field]
+                            composed[-1, batch_index, destination_positions] = (
+                                source_value[
+                                    -1, batch_index, source_query_positions
+                                ]
+                            )
+                    output_task[field] = composed
+                output_task['s2_source_routes'] = source_routes
+                output_tasks.append(output_task)
+            output_levels.append(output_tasks)
+        if isinstance(anchor_preds, tuple):
+            return tuple(output_levels)
+        return output_levels
+
+    def final_detection_head_fields(self, preds_dicts):
+        """Expose the exact six final-layer field tensors for S2 audit."""
+
+        return [
+            {
+                field: task[field][-1]
+                for field in FINAL_DETECTION_HEAD_FIELDS
+            }
+            for task in preds_dicts[0]
+        ]
+
+    def build_query_targets(self, gt_bboxes_3d, gt_labels_3d, preds_dicts,
+                            route_index=0):
+        """Run Hungarian assignment once and return a reusable target bundle."""
+
+        pred_bboxes, pred_logits = self.final_task_predictions(
+            preds_dicts, route_index=route_index
+        )
+        batch_size = pred_bboxes[0].shape[0]
+        per_image_bboxes = [
+            [task_prediction[index] for task_prediction in pred_bboxes]
+            for index in range(batch_size)
+        ]
+        per_image_logits = [
+            [task_prediction[index] for task_prediction in pred_logits]
+            for index in range(batch_size)
+        ]
+        targets = self.get_targets(
+            gt_bboxes_3d,
+            gt_labels_3d,
+            per_image_bboxes,
+            per_image_logits,
+        )
+        keys = (
+            'labels',
+            'label_weights',
+            'bbox_targets',
+            'bbox_weights',
+            'num_total_pos',
+            'num_total_neg',
+        )
+        return dict(zip(keys, targets))
+
+    def query_losses_from_targets(self, preds_dicts, target_bundle, route_index=0):
+        """Return normalized classification, box and total loss per query.
+
+        The same ``target_bundle`` can be applied to Fused, LiDAR and Camera
+        executions, which implements the fixed-Fused-Hungarian proxy.  Building
+        a fresh bundle for the candidate execution gives the rematched
+        sensitivity result used by the strict 20-scene audit.
+        """
+
+        pred_bboxes, pred_logits = self.final_task_predictions(
+            preds_dicts, route_index=route_index
+        )
+        batch_size, num_queries = pred_bboxes[0].shape[:2]
+        query_cls = pred_bboxes[0].new_zeros((batch_size, num_queries))
+        query_bbox = pred_bboxes[0].new_zeros((batch_size, num_queries))
+        positive_mask = torch.zeros(
+            (batch_size, num_queries), device=pred_bboxes[0].device, dtype=torch.bool
+        )
+
+        for task_index, (task_boxes, task_logits) in enumerate(
+            zip(pred_bboxes, pred_logits)
+        ):
+            labels = torch.stack(target_bundle['labels'][task_index], dim=0)
+            label_weights = torch.stack(
+                target_bundle['label_weights'][task_index], dim=0
+            )
+            bbox_targets = torch.stack(
+                target_bundle['bbox_targets'][task_index], dim=0
+            )
+            bbox_weights = torch.stack(
+                target_bundle['bbox_weights'][task_index], dim=0
+            )
+
+            cls_avg_factor = max(
+                target_bundle['num_total_pos'][task_index]
+                + 0.1 * target_bundle['num_total_neg'][task_index],
+                1,
+            )
+            raw_cls = self.loss_cls(
+                task_logits.flatten(0, 1),
+                labels.flatten(0, 1),
+                label_weights.flatten(0, 1),
+                reduction_override='none',
+            )
+            if raw_cls.ndim > 1:
+                raw_cls = raw_cls.sum(dim=-1)
+            query_cls += raw_cls.reshape(batch_size, num_queries) / cls_avg_factor
+
+            normalized_targets = normalize_bbox(bbox_targets, self.pc_range)
+            valid = torch.isfinite(normalized_targets).all(dim=-1)
+            weighted_boxes = bbox_weights * bbox_weights.new_tensor(
+                self.train_cfg.code_weights
+            )[None, None, :]
+            task_positive = weighted_boxes[..., :10].abs().sum(dim=-1) > 0
+            positive_mask |= task_positive
+            flat_valid = valid.flatten(0, 1)
+            if flat_valid.any():
+                raw_bbox = self.loss_bbox(
+                    task_boxes.flatten(0, 1)[flat_valid, :10],
+                    normalized_targets.flatten(0, 1)[flat_valid, :10],
+                    weighted_boxes.flatten(0, 1)[flat_valid, :10],
+                    reduction_override='none',
+                )
+                if raw_bbox.ndim > 1:
+                    raw_bbox = raw_bbox.sum(dim=-1)
+                flat_query_bbox = query_bbox.new_zeros(batch_size * num_queries)
+                flat_query_bbox[flat_valid] = raw_bbox / max(
+                    target_bundle['num_total_pos'][task_index], 1
+                )
+                query_bbox += flat_query_bbox.reshape(batch_size, num_queries)
+
+        query_cls = torch.nan_to_num(query_cls)
+        query_bbox = torch.nan_to_num(query_bbox)
+        return {
+            'classification': query_cls,
+            'bbox': query_bbox,
+            'total': query_cls + query_bbox,
+            'positive_mask': positive_mask,
+        }
+
+    def return_query_losses(self, gt_bboxes_3d, gt_labels_3d, preds_dicts,
+                            fixed_targets=None, route_index=0):
+        """Public QTA loss interface with optional fixed Hungarian targets."""
+
+        target_bundle = fixed_targets
+        if target_bundle is None:
+            target_bundle = self.build_query_targets(
+                gt_bboxes_3d,
+                gt_labels_3d,
+                preds_dicts,
+                route_index=route_index,
+            )
+        losses = self.query_losses_from_targets(
+            preds_dicts,
+            target_bundle,
+            route_index=route_index,
+        )
+        losses['target_bundle'] = target_bundle
+        return losses
+
+    def query_loss_for_original_query(
+        self,
+        preds_dicts,
+        target_bundle,
+        prediction_query_indices,
+        target_query_indices,
+        query_index,
+        route_index=0,
+    ):
+        """Return fixed-Hungarian loss for one original query identity.
+
+        Mixed MoME predictions are grouped by expert and may rarely omit a
+        numerically zero decoder slot.  The explicit id tensors let the strict
+        audit compare the same original query without reordering or changing
+        the frozen inference output.
+        """
+
+        if prediction_query_indices.shape[0] != 1 or target_query_indices.shape[0] != 1:
+            raise ValueError('strict query-id loss requires batch size one')
+        prediction_positions = torch.nonzero(
+            prediction_query_indices[0] == int(query_index), as_tuple=False
+        ).flatten()
+        target_positions = torch.nonzero(
+            target_query_indices[0] == int(query_index), as_tuple=False
+        ).flatten()
+        reference = torch.tensor(
+            float('nan'), device=prediction_query_indices.device,
+            dtype=torch.float32)
+        if prediction_positions.numel() != 1 or target_positions.numel() != 1:
+            return reference
+        prediction_position = int(prediction_positions.item())
+        target_position = int(target_positions.item())
+        pred_bboxes, pred_logits = self.final_task_predictions(
+            preds_dicts, route_index=route_index
+        )
+        query_loss = pred_bboxes[0].new_zeros(())
+        for task_index, (task_boxes, task_logits) in enumerate(
+            zip(pred_bboxes, pred_logits)
+        ):
+            labels = target_bundle['labels'][task_index][0][
+                target_position
+            ].reshape(1)
+            label_weights = target_bundle['label_weights'][task_index][0][
+                target_position
+            ].reshape(1)
+            bbox_targets = target_bundle['bbox_targets'][task_index][0][
+                target_position
+            ].unsqueeze(0)
+            bbox_weights = target_bundle['bbox_weights'][task_index][0][
+                target_position
+            ].unsqueeze(0)
+            cls_avg_factor = max(
+                target_bundle['num_total_pos'][task_index]
+                + 0.1 * target_bundle['num_total_neg'][task_index],
+                1,
+            )
+            raw_cls = self.loss_cls(
+                task_logits[0, prediction_position].unsqueeze(0),
+                labels,
+                label_weights,
+                reduction_override='none',
+            )
+            query_loss = query_loss + raw_cls.sum() / cls_avg_factor
+            normalized_targets = normalize_bbox(bbox_targets, self.pc_range)
+            if torch.isfinite(normalized_targets).all():
+                weighted_boxes = bbox_weights * bbox_weights.new_tensor(
+                    self.train_cfg.code_weights
+                )[None, :]
+                raw_bbox = self.loss_bbox(
+                    task_boxes[0, prediction_position, :10].unsqueeze(0),
+                    normalized_targets[:, :10],
+                    weighted_boxes[:, :10],
+                    reduction_override='none',
+                )
+                query_loss = query_loss + raw_bbox.sum() / max(
+                    target_bundle['num_total_pos'][task_index], 1
+                )
+        return torch.nan_to_num(query_loss)
 
     def _loss_single_task(self,
                           pred_bboxes,
