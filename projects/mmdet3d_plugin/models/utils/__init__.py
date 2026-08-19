@@ -3,3 +3,4 @@ from .petr_transformer import *
 from .pme_transformer import *
 from .multi_expert import *
 from .qta_router import *
+from .object_set_attribute_fusion import *

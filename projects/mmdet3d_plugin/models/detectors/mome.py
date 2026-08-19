@@ -30,6 +30,9 @@ from projects.mmdet3d_plugin.models.utils.qta_router import (
     select_full_query_oracle_routes,
     select_robust_oracle_actions,
 )
+from projects.mmdet3d_plugin.models.utils.object_set_attribute_fusion import (
+    ROUTE_ORDER as OBJECT_SET_ROUTE_ORDER,
+)
 from projects.mmdet3d_plugin import SPConvVoxelization
 
 
@@ -924,27 +927,78 @@ class MoME(MVXTwoStageDetector):
                 return False
         return True
 
-    def forward_qta_context_preserving_output_oracle(
+    def _qta_complete_zero_input(self, points, img, img_metas):
+        """Detect exact whole-modality zeros without reading fault metadata."""
+
+        if len(img_metas) != 1:
+            raise ValueError('complete-zero input audit requires batch size one')
+        if points is None:
+            point_sample = None
+        elif isinstance(points, (list, tuple)):
+            if len(points) != 1:
+                raise ValueError('complete-zero input audit requires one point sample')
+            point_sample = points[0]
+        else:
+            point_sample = points
+        if hasattr(point_sample, 'tensor'):
+            point_sample = point_sample.tensor
+        lidar_zero = (
+            torch.is_tensor(point_sample)
+            and torch.count_nonzero(point_sample).item() == 0
+        )
+
+        if img is not None and torch.is_tensor(img) and img.ndim == 4:
+            image_sample = img
+        elif img is None:
+            image_sample = None
+        elif torch.is_tensor(img) and img.ndim == 5:
+            if img.shape[0] != 1:
+                raise ValueError('complete-zero input audit requires one image sample')
+            image_sample = img[0]
+        elif isinstance(img, (list, tuple)):
+            if len(img) == 1 and (
+                torch.is_tensor(img[0]) and img[0].ndim == 4
+            ):
+                image_sample = img[0]
+            else:
+                image_sample = img
+        else:
+            image_sample = img
+        camera_zero = self._camera_sample_is_zero(image_sample, img_metas[0])
+        return bool(lidar_zero or camera_zero)
+
+    def _forward_full_context_expert_bundle(
         self,
         points,
         img_metas,
-        img,
-        gt_bboxes_3d,
-        gt_labels_3d,
-        epsilon_query_keep=0.0,
-        epsilon_query_reconstruction=0.0,
-        return_predictions=True,
-        return_raw_predictions=False,
+        img=None,
+        decode=True,
+        complete_zero_bypass=True,
     ):
-        """Compose complete-context final head outputs without decoder reruns."""
+        """Run original MoME and the three complete-context expert routes.
+
+        This is the no-GT Stage019-S4 inference boundary.  For an exact
+        whole-LiDAR or whole-camera zero it runs only the original MoME path;
+        actionable inputs share one feature extraction across original,
+        Fused, LiDAR and Camera decoder executions.  No corruption name,
+        affected-object mask or ground truth is accepted by the interface.
+
+        ``complete_zero_bypass=False`` is reserved for the pre-existing S2/S3
+        Oracle, whose four-decoder protocol must remain unchanged.
+        """
 
         if self.training:
             raise RuntimeError(
-                'forward_qta_context_preserving_output_oracle requires model.eval()'
+                '_forward_full_context_expert_bundle requires model.eval()'
             )
         if len(img_metas) != 1:
-            raise ValueError('context-preserving Oracle requires batch size one')
+            raise ValueError('full-context expert bundle requires batch size one')
         self._require_qta_probe_state()
+        hard_bypass = False
+        if complete_zero_bypass:
+            self._annotate_qta_complete_failure(points, img, img_metas)
+            hard_bypass = self._qta_complete_zero_input(points, img, img_metas)
+
         img_feats, pts_feats = self.extract_feat(
             points, img=img, img_metas=img_metas
         )
@@ -967,10 +1021,48 @@ class MoME(MVXTwoStageDetector):
             )
 
         original_preds = execute(None)
-        route_preds = [execute(route) for route in range(3)]
         original_indices = self.pts_bbox_head.validate_s2_prediction_bundle(
             original_preds, 'original_mome', expected_query_count=900
         )
+        original_task = original_preds[0][0]
+        base_routes = original_task['base_routes'].long()
+        router_features = original_task['router_features']
+        reference_points = original_task['reference_points']
+        if base_routes.shape != original_indices.shape:
+            raise RuntimeError('original route vector does not align with query ids')
+        if router_features.shape[:2] != base_routes.shape:
+            raise RuntimeError('router features do not align with original routes')
+        if reference_points.shape[:2] != base_routes.shape:
+            raise RuntimeError('reference points do not align with original routes')
+
+        original_bbox = None
+        if decode:
+            original_bbox = self._qta_bbox_results(
+                self.pts_bbox_head.get_bboxes(
+                    original_preds, img_metas, rescale=False
+                )
+            )
+
+        output = {
+            'route_order': OBJECT_SET_ROUTE_ORDER,
+            'hard_bypass': hard_bypass,
+            'decoder_call_count': decoder_call_count,
+            'query_ids': {
+                'original': original_indices,
+                'experts': {},
+            },
+            'base_routes': base_routes,
+            'router_features': router_features,
+            'reference_points': reference_points,
+            'original_bbox': original_bbox,
+            'expert_bboxes': {},
+            'original_raw_predictions': original_preds,
+            'expert_raw_predictions': {},
+        }
+        if hard_bypass:
+            return output
+
+        route_preds = [execute(route) for route in range(3)]
         route_indices = [
             self.pts_bbox_head.validate_s2_prediction_bundle(
                 predictions,
@@ -978,6 +1070,76 @@ class MoME(MVXTwoStageDetector):
                 expected_query_count=900,
             )
             for route, predictions in enumerate(route_preds)
+        ]
+        expert_raw_predictions = {
+            role: predictions
+            for role, predictions in zip(OBJECT_SET_ROUTE_ORDER, route_preds)
+        }
+        expert_bboxes = {}
+        if decode:
+            expert_bboxes = {
+                role: self._qta_bbox_results(
+                    self.pts_bbox_head.get_bboxes(
+                        predictions, img_metas, rescale=False
+                    )
+                )
+                for role, predictions in expert_raw_predictions.items()
+            }
+        output.update(
+            {
+                'decoder_call_count': decoder_call_count,
+                'query_ids': {
+                    'original': original_indices,
+                    'experts': {
+                        role: indices
+                        for role, indices in zip(
+                            OBJECT_SET_ROUTE_ORDER, route_indices
+                        )
+                    },
+                },
+                'expert_bboxes': expert_bboxes,
+                'expert_raw_predictions': expert_raw_predictions,
+            }
+        )
+        return output
+
+    def forward_qta_context_preserving_output_oracle(
+        self,
+        points,
+        img_metas,
+        img,
+        gt_bboxes_3d,
+        gt_labels_3d,
+        epsilon_query_keep=0.0,
+        epsilon_query_reconstruction=0.0,
+        return_predictions=True,
+        return_raw_predictions=False,
+    ):
+        """Compose complete-context final head outputs without decoder reruns."""
+
+        if self.training:
+            raise RuntimeError(
+                'forward_qta_context_preserving_output_oracle requires model.eval()'
+            )
+        if len(img_metas) != 1:
+            raise ValueError('context-preserving Oracle requires batch size one')
+        full_context = self._forward_full_context_expert_bundle(
+            points,
+            img_metas,
+            img=img,
+            decode=False,
+            complete_zero_bypass=False,
+        )
+        decoder_call_count = full_context['decoder_call_count']
+        original_preds = full_context['original_raw_predictions']
+        route_preds = [
+            full_context['expert_raw_predictions'][role]
+            for role in OBJECT_SET_ROUTE_ORDER
+        ]
+        original_indices = full_context['query_ids']['original']
+        route_indices = [
+            full_context['query_ids']['experts'][role]
+            for role in OBJECT_SET_ROUTE_ORDER
         ]
         all_keep_preds = self.pts_bbox_head.compose_final_detection_head_outputs(
             original_preds,
@@ -995,8 +1157,7 @@ class MoME(MVXTwoStageDetector):
         )
         if not all_keep_tensor_exact:
             raise RuntimeError('all-KEEP final head composition drifted from MoME')
-        original_task = original_preds[0][0]
-        original_routes = original_task['base_routes'].long()
+        original_routes = full_context['base_routes']
         if original_routes.shape != original_indices.shape:
             raise RuntimeError('original route vector does not align with query ids')
 
