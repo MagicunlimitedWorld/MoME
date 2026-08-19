@@ -12,11 +12,19 @@ import numpy as np
 try:
     from .common import atomic_write_json
     from .extract_route_loss_cache import is_relative_to, sha256_file
-    from .stage019_s2_training_conditions import CONDITIONS
+    from .stage019_s2_training_conditions import (
+        CONDITIONS,
+        S3_ACTIONABLE_CONDITIONS,
+        S3_HARD_BYPASS_CONDITIONS,
+    )
 except ImportError:
     from common import atomic_write_json
     from extract_route_loss_cache import is_relative_to, sha256_file
-    from stage019_s2_training_conditions import CONDITIONS
+    from stage019_s2_training_conditions import (
+        CONDITIONS,
+        S3_ACTIONABLE_CONDITIONS,
+        S3_HARD_BYPASS_CONDITIONS,
+    )
 
 
 REPEAT_PROFILES = {
@@ -37,6 +45,9 @@ EXPECTED_FRAMES = 803
 EXPECTED_QUERIES = 900
 CANDIDATE_KS = (4, 8, 16)
 REQUIRED_COVERAGE = 0.95
+LEGACY_PROTOCOL_PROFILE = "stage019_s2_legacy_v1"
+S3_PROTOCOL_PROFILE = "stage019_s3_actionable_hard_bypass_v1"
+PROTOCOL_PROFILES = (LEGACY_PROTOCOL_PROFILE, S3_PROTOCOL_PROFILE)
 
 
 def parse_args() -> argparse.Namespace:
@@ -50,8 +61,44 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--canonical-repeat-id", required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--artifact-root", type=Path, required=True)
+    parser.add_argument(
+        "--protocol-profile",
+        choices=PROTOCOL_PROFILES,
+        default=LEGACY_PROTOCOL_PROFILE,
+    )
+    parser.add_argument("--source-calibration-root", type=Path)
+    parser.add_argument(
+        "--expected-repeat-manifest-sha256",
+        action="append",
+        default=[],
+        metavar="REPEAT_ID=SHA256",
+    )
     parser.add_argument("--allow-smoke", action="store_true")
     return parser.parse_args()
+
+
+def protocol_conditions(profile: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    if profile == S3_PROTOCOL_PROFILE:
+        return S3_ACTIONABLE_CONDITIONS, S3_HARD_BYPASS_CONDITIONS
+    return CONDITIONS, ()
+
+
+def expected_manifest_hashes(values: list[str]) -> dict[str, str]:
+    output = {}
+    for value in values:
+        repeat_id, separator, digest = value.partition("=")
+        if not separator or not repeat_id or len(digest) != 64:
+            raise ValueError(
+                "expected repeat manifest hashes must use REPEAT_ID=64_HEX_SHA256"
+            )
+        try:
+            int(digest, 16)
+        except ValueError as exc:
+            raise ValueError("repeat manifest SHA256 is not hexadecimal") from exc
+        if repeat_id in output:
+            raise ValueError(f"duplicate expected repeat manifest hash: {repeat_id}")
+        output[repeat_id] = digest.upper()
+    return output
 
 
 def expected_repeat_ids(profile: str) -> tuple[str, ...]:
@@ -203,6 +250,24 @@ def _budget_from_quality(total: float, captured: dict[int, float]) -> dict:
 def main() -> int:
     args = parse_args()
     expected_ids = expected_repeat_ids(args.repeat_profile)
+    actionable_conditions, hard_bypass_conditions = protocol_conditions(
+        args.protocol_profile
+    )
+    expected_hashes = expected_manifest_hashes(
+        args.expected_repeat_manifest_sha256
+    )
+    source_calibration_root = (
+        args.source_calibration_root.resolve()
+        if args.source_calibration_root is not None
+        else None
+    )
+    if args.protocol_profile == S3_PROTOCOL_PROFILE:
+        if source_calibration_root is None:
+            raise ValueError("S3 reaggregation requires --source-calibration-root")
+        if set(expected_hashes) != set(expected_ids):
+            raise ValueError("S3 reaggregation requires one locked hash per repeat manifest")
+    elif args.source_calibration_root is not None or expected_hashes:
+        raise ValueError("source calibration locks are reserved for the S3 profile")
     if len(args.repeat_dir) != len(expected_ids):
         raise ValueError(
             f"{args.repeat_profile} requires exactly {len(expected_ids)} "
@@ -224,6 +289,10 @@ def main() -> int:
     allowed_statuses = {"passed", "smoke_passed"} if args.allow_smoke else {"passed"}
     for repeat_dir in args.repeat_dir:
         repeat_dir = repeat_dir.resolve()
+        if source_calibration_root is not None and not is_relative_to(
+            repeat_dir, source_calibration_root
+        ):
+            raise ValueError("S3 repeat directory escaped the locked source root")
         manifest_path = repeat_dir / "calibration_repeat_manifest.json"
         manifest = _load_json(manifest_path)
         repeat_id = str(manifest.get("repeat_id"))
@@ -231,6 +300,10 @@ def main() -> int:
             raise ValueError(f"repeat is not complete: {repeat_dir}")
         if repeat_id in repeat_by_id:
             raise ValueError(f"duplicate repeat id: {repeat_id}")
+        if expected_hashes and sha256_file(manifest_path).upper() != expected_hashes.get(
+            repeat_id
+        ):
+            raise ValueError(f"locked source repeat manifest hash drifted: {repeat_id}")
         repeat_by_id[repeat_id] = repeat_dir
         manifests.append((repeat_dir, manifest_path, manifest))
     validate_repeat_identity(
@@ -263,21 +336,25 @@ def main() -> int:
             "original_mome": np.zeros(3, dtype=np.float64),
             "reconstruction": np.zeros(3, dtype=np.float64),
         }
-        for condition in CONDITIONS
+        for condition in actionable_conditions
     }
     proxy_overestimate = {
-        condition: np.zeros(3, dtype=np.float64) for condition in CONDITIONS
+        condition: np.zeros(3, dtype=np.float64)
+        for condition in actionable_conditions
     }
     proxy_audit_count = {
-        condition: np.zeros(3, dtype=np.int64) for condition in CONDITIONS
+        condition: np.zeros(3, dtype=np.int64)
+        for condition in actionable_conditions
     }
-    epsilon_frame = {condition: 0.0 for condition in CONDITIONS}
-    frame_action_audit_count = {condition: 0 for condition in CONDITIONS}
+    epsilon_frame = {condition: 0.0 for condition in actionable_conditions}
+    frame_action_audit_count = {
+        condition: 0 for condition in actionable_conditions
+    }
     low_margin_action_count = 0
     frame_count_by_condition = {}
 
     # First pass locks paired numerical envelopes and proxy over-estimation.
-    for condition in CONDITIONS:
+    for condition in actionable_conditions:
         frame_sets = []
         for repeat_dir, _, _ in manifests:
             frame_sets.append(
@@ -377,7 +454,7 @@ def main() -> int:
 
     missing_proxy_cells = [
         f"{condition}:{destination}"
-        for condition in CONDITIONS
+        for condition in actionable_conditions
         for destination in range(3)
         if int(proxy_audit_count[condition][destination]) == 0
     ]
@@ -386,7 +463,7 @@ def main() -> int:
     total_quality = 0.0
     captured_quality = {key: 0.0 for key in CANDIDATE_KS}
     positive_action_count = 0
-    for condition in CONDITIONS:
+    for condition in actionable_conditions:
         frame_dir = canonical_dir / condition / "frames"
         for npz_path in sorted(frame_dir.glob("*.npz")):
             bundle = _load_npz(npz_path)
@@ -413,22 +490,47 @@ def main() -> int:
     elif budget["status"] != "coverage_reached":
         status = "candidate_mass_not_coverable_under_K16"
 
+    calibration_claim_boundary = claim_boundary(args.repeat_profile)
+    if args.protocol_profile == S3_PROTOCOL_PROFILE:
+        calibration_claim_boundary += (
+            "_derived_from_locked_training_only_raw_repeats_for_actionable_conditions"
+        )
+    applicability = {
+        condition: {
+            str(destination): "audited" for destination in range(3)
+        }
+        for condition in actionable_conditions
+    }
+    applicability.update(
+        {
+            condition: {
+                str(destination): "hard_bypass_not_applicable"
+                for destination in range(3)
+            }
+            for condition in hard_bypass_conditions
+        }
+    )
+
     margins = {
         "schema": "visfuse3d_stage019_s2_calibration_margins_v1",
         "status": status,
+        "protocol_profile": args.protocol_profile,
         "repeat_profile": args.repeat_profile,
         "repeat_ids": list(expected_ids),
-        "claim_boundary": claim_boundary(args.repeat_profile),
+        "actionable_conditions": list(actionable_conditions),
+        "hard_bypass_conditions": list(hard_bypass_conditions),
+        "condition_destination_applicability": applicability,
+        "claim_boundary": calibration_claim_boundary,
         "epsilon_num_query": {
             condition: {
                 baseline: values.tolist()
                 for baseline, values in epsilon_query[condition].items()
             }
-            for condition in CONDITIONS
+            for condition in actionable_conditions
         },
         "proxy_overestimate": {
             condition: proxy_overestimate[condition].tolist()
-            for condition in CONDITIONS
+            for condition in actionable_conditions
         },
         "epsilon_num_frame": epsilon_frame,
         "candidate_budget": budget,
@@ -441,9 +543,13 @@ def main() -> int:
     manifest = {
         "schema": "visfuse3d_stage019_s2_calibration_aggregate_v1",
         "status": status,
+        "protocol_profile": args.protocol_profile,
         "repeat_profile": args.repeat_profile,
         "expected_repeat_ids": list(expected_ids),
-        "claim_boundary": claim_boundary(args.repeat_profile),
+        "actionable_conditions": list(actionable_conditions),
+        "hard_bypass_conditions": list(hard_bypass_conditions),
+        "condition_destination_applicability": applicability,
+        "claim_boundary": calibration_claim_boundary,
         "canonical_repeat_id": args.canonical_repeat_id,
         "repeat_manifests": [
             {
@@ -458,12 +564,25 @@ def main() -> int:
         "paired_frame_condition_count": int(sum(frame_count_by_condition.values())),
         "proxy_audit_count": {
             condition: proxy_audit_count[condition].tolist()
-            for condition in CONDITIONS
+            for condition in actionable_conditions
         },
         "frame_action_audit_count": frame_action_audit_count,
         "missing_condition_destination_audits": missing_proxy_cells,
         "positive_robust_action_count": positive_action_count,
         "locked_source_identity": locked_identity,
+        "source_calibration_root": (
+            str(source_calibration_root) if source_calibration_root else None
+        ),
+        "source_repeat_manifest_sha256": {
+            repeat_id: expected_hashes[repeat_id]
+            for repeat_id in expected_ids
+            if repeat_id in expected_hashes
+        },
+        "source_reuse_policy": (
+            "read_only_raw_trace_and_npz_only_no_prior_margins_or_diagnostic_K"
+            if args.protocol_profile == S3_PROTOCOL_PROFILE
+            else "native_profile"
+        ),
         "margins_path": str((output_dir / "calibration_margins.json").resolve()),
         "margins_sha256": sha256_file(output_dir / "calibration_margins.json"),
     }

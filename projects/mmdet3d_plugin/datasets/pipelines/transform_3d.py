@@ -5,6 +5,8 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 # ------------------------------------------------------------------------
 
+import hashlib
+
 import cv2
 import mmcv
 import numpy as np
@@ -860,6 +862,212 @@ class ModalMask3D(object):
         """str: Return a string that describes the module."""
         repr_str = self.__class__.__name__
         return repr_str
+
+
+@PIPELINES.register_module()
+class QtaLocalCorruption3D(object):
+    """Deterministic, train-only corruptions for MoME-QTA-AQR.
+
+    The local corruptions are procedural and deliberately do not read
+    nuScenes-R masks or reproduce its formal severity settings.  Geometry is
+    retained in ``qta_corruption`` so the equal-capacity local-health control
+    can derive query-region labels without seeing validation annotations.
+    """
+
+    CONDITIONS = (
+        'clean',
+        'lidar_zero',
+        'camera_zero',
+        'lidar_sector_missing',
+        'lidar_object_points_missing',
+        'camera_local_occlusion',
+    )
+    FORBIDDEN_SOURCE_MARKERS = (
+        'nuscenes-r',
+        'mud_mask',
+        'limited_fov',
+        'object_failure',
+    )
+
+    def __init__(self, mode='train', seed=20260710, conditions=None,
+                 forced_condition=None):
+        if mode != 'train':
+            raise ValueError('QtaLocalCorruption3D is restricted to nuScenes train')
+        self.mode = mode
+        self.seed = int(seed)
+        self.conditions = tuple(conditions or self.CONDITIONS)
+        if set(self.conditions) != set(self.CONDITIONS):
+            raise ValueError('QTA training must include the six locked conditions')
+        if forced_condition is not None and forced_condition not in self.conditions:
+            raise ValueError(f'Unknown forced QTA condition: {forced_condition}')
+        self.forced_condition = forced_condition
+
+    def _sample_key(self, input_dict):
+        return str(
+            input_dict.get('sample_idx')
+            or input_dict.get('token')
+            or input_dict.get('pts_filename')
+            or input_dict.get('filename')
+        )
+
+    def _rng(self, sample_key):
+        digest = hashlib.sha256(
+            f'{sample_key}|mome-qta-local-v1|{self.seed}'.encode('utf-8')
+        ).digest()
+        return np.random.RandomState(int.from_bytes(digest[:4], 'little'))
+
+    def _guard_train_source(self, input_dict):
+        values = [input_dict.get('pts_filename', '')]
+        filenames = input_dict.get('filename', [])
+        if isinstance(filenames, str):
+            values.append(filenames)
+        else:
+            values.extend(filenames)
+        joined = '|'.join(str(value).replace('\\', '/').lower() for value in values)
+        hit = [marker for marker in self.FORBIDDEN_SOURCE_MARKERS if marker in joined]
+        if hit:
+            raise RuntimeError(
+                'QTA train-only corruption received forbidden evaluation source: '
+                + ','.join(hit)
+            )
+
+    @staticmethod
+    def _set_points(input_dict, tensor):
+        input_dict['points'].tensor = tensor
+
+    def _drop_lidar_sector(self, input_dict, rng):
+        tensor = input_dict['points'].tensor
+        width_ranges = ((18.0, 48.0), (72.0, 108.0))
+        low, high = width_ranges[int(rng.randint(0, len(width_ranges)))]
+        width_deg = float(rng.uniform(low, high))
+        center_deg = float(rng.uniform(-180.0, 180.0))
+        angles = torch.atan2(tensor[:, 1], tensor[:, 0])
+        center = angles.new_tensor(np.deg2rad(center_deg))
+        half_width = np.deg2rad(width_deg) / 2.0
+        delta = torch.atan2(torch.sin(angles - center), torch.cos(angles - center))
+        keep = delta.abs() > half_width
+        self._set_points(input_dict, tensor[keep])
+        return {
+            'sector_center_deg': center_deg,
+            'sector_width_deg': width_deg,
+            'removed_points': int((~keep).sum().item()),
+        }
+
+    def _drop_object_points(self, input_dict, rng):
+        tensor = input_dict['points'].tensor
+        boxes = input_dict.get('gt_bboxes_3d')
+        if boxes is None or len(boxes) == 0 or tensor.shape[0] == 0:
+            return {'selected_box_indices': [], 'removed_points': 0, 'drop_fraction': 0.0}
+        box_fraction = float(rng.uniform(0.25, 0.75))
+        selected_count = max(1, int(np.ceil(len(boxes) * box_fraction)))
+        selected = np.sort(rng.choice(len(boxes), selected_count, replace=False))
+        membership = box_np_ops.points_in_rbbox(
+            tensor[:, :3].detach().cpu().numpy(),
+            boxes.tensor[:, :7].detach().cpu().numpy(),
+        )
+        affected = torch.from_numpy(membership[:, selected].any(axis=1)).to(
+            device=tensor.device
+        )
+        drop_fraction = float(rng.uniform(0.55, 0.9))
+        random_values = torch.from_numpy(rng.rand(tensor.shape[0])).to(
+            device=tensor.device, dtype=tensor.dtype
+        )
+        remove = affected & (random_values < drop_fraction)
+        self._set_points(input_dict, tensor[~remove])
+        return {
+            'selected_box_indices': [int(index) for index in selected],
+            'removed_points': int(remove.sum().item()),
+            'drop_fraction': drop_fraction,
+        }
+
+    @staticmethod
+    def _occlusion_polygon(height, width, rng):
+        center_x = float(rng.uniform(0.2, 0.8) * width)
+        center_y = float(rng.uniform(0.25, 0.75) * height)
+        half_width = float(rng.uniform(0.08, 0.2) * width)
+        half_height = float(rng.uniform(0.1, 0.25) * height)
+        points = np.array(
+            [
+                [center_x - half_width, center_y - half_height * rng.uniform(0.6, 1.0)],
+                [center_x + half_width * rng.uniform(0.6, 1.0), center_y - half_height],
+                [center_x + half_width, center_y + half_height * rng.uniform(0.6, 1.0)],
+                [center_x - half_width * rng.uniform(0.6, 1.0), center_y + half_height],
+            ],
+            dtype=np.float32,
+        )
+        points[:, 0] = np.clip(points[:, 0], 0, width - 1)
+        points[:, 1] = np.clip(points[:, 1], 0, height - 1)
+        return np.round(points).astype(np.int32)
+
+    def _occlude_camera(self, input_dict, rng):
+        images = list(input_dict['img'])
+        view_count = min(len(images), int(rng.randint(1, 3)))
+        selected_views = np.sort(rng.choice(len(images), view_count, replace=False))
+        polygons = {}
+        for view_index in selected_views.tolist():
+            image = images[view_index].copy()
+            polygon = self._occlusion_polygon(image.shape[0], image.shape[1], rng)
+            cv2.fillPoly(image, [polygon], color=(0, 0, 0))
+            images[view_index] = image
+            polygons[str(view_index)] = polygon.tolist()
+        input_dict['img'] = images
+        return {
+            'selected_views': [int(index) for index in selected_views],
+            'polygons_xy': polygons,
+            'source': 'procedural_polygon_no_external_mask',
+        }
+
+    def __call__(self, input_dict):
+        self._guard_train_source(input_dict)
+        sample_key = self._sample_key(input_dict)
+        rng = self._rng(sample_key)
+        requested = input_dict.get('qta_condition', self.forced_condition)
+        if requested is None:
+            digest = hashlib.sha256(
+                f'{sample_key}|mome-qta-condition-v1|{self.seed}'.encode('utf-8')
+            ).digest()
+            condition = self.conditions[int.from_bytes(digest[:8], 'little') % len(self.conditions)]
+        else:
+            condition = str(requested)
+            if condition not in self.conditions:
+                raise ValueError(f'Unknown qta_condition: {condition}')
+
+        details = {}
+        input_dict['modalmask'] = [1, 0, 0]
+        input_dict['qta_route_available'] = [True, True, True]
+        input_dict['qta_hard_bypass'] = False
+        if condition == 'lidar_zero':
+            self._set_points(input_dict, input_dict['points'].tensor * 0.0)
+            input_dict['modalmask'] = [0, 0, 1]
+            input_dict['qta_route_available'] = [False, False, True]
+            input_dict['qta_hard_bypass'] = True
+        elif condition == 'camera_zero':
+            input_dict['img'] = [0.0 * image for image in input_dict['img']]
+            input_dict['modalmask'] = [0, 1, 0]
+            input_dict['qta_route_available'] = [False, True, False]
+            input_dict['qta_hard_bypass'] = True
+        elif condition == 'lidar_sector_missing':
+            details = self._drop_lidar_sector(input_dict, rng)
+        elif condition == 'lidar_object_points_missing':
+            details = self._drop_object_points(input_dict, rng)
+        elif condition == 'camera_local_occlusion':
+            details = self._occlude_camera(input_dict, rng)
+
+        input_dict['qta_corruption'] = {
+            'protocol': 'mome_qta_train_local_v1',
+            'seed': self.seed,
+            'condition': condition,
+            'sample_key_sha256': hashlib.sha256(sample_key.encode('utf-8')).hexdigest(),
+            'details': details,
+        }
+        return input_dict
+
+    def __repr__(self):
+        return (
+            f'{self.__class__.__name__}(mode={self.mode!r}, seed={self.seed}, '
+            f'conditions={self.conditions!r}, '
+            f'forced_condition={self.forced_condition!r})'
+        )
 
 
 @PIPELINES.register_module()

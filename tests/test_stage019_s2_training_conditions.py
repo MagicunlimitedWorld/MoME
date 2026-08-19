@@ -23,3 +23,11 @@ def test_training_condition_assignments_are_deterministic_and_bounded() -> None:
     ]
     assert all(1 <= value <= 16 for value in observed)
     assert len(module.CONDITIONS) == 7
+    assert module.S3_ACTIONABLE_CONDITIONS == (
+        'clean',
+        'beam_reduction_4',
+        'limited_fov_original_code_60',
+        'lidar_object_failure',
+        'camera_mud_mask',
+    )
+    assert module.S3_HARD_BYPASS_CONDITIONS == ('lidar_zero', 'camera_zero')

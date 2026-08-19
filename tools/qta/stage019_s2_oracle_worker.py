@@ -35,6 +35,7 @@ try:
         _scene_dataset_indices,
     )
     from .route_snapshot_worker import recursive_sha256
+    from .stage019_s2_training_conditions import S3_HARD_BYPASS_CONDITIONS
 except ImportError:
     from common import atomic_write_json
     from extract_route_loss_cache import (
@@ -56,6 +57,7 @@ except ImportError:
         _scene_dataset_indices,
     )
     from route_snapshot_worker import recursive_sha256
+    from stage019_s2_training_conditions import S3_HARD_BYPASS_CONDITIONS
 
 
 STAGE_ID = "Stage019-S2"
@@ -66,6 +68,8 @@ RUN_ID = (
     "2026-08-17-mome-stage019-s2-context-preserving-output-oracle-and-"
     "greedy-joint-gt-oracle-v1"
 )
+LEGACY_PROTOCOL_PROFILE = "stage019_s2_legacy_v1"
+S3_PROTOCOL_PROFILE = "stage019_s3_actionable_hard_bypass_v1"
 S2A_ROLES = (
     "original_mome",
     "keep_anchored_output_oracle",
@@ -101,6 +105,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--expected-gpu-pci", required=True)
     parser.add_argument("--seed", type=int, default=20260817)
     parser.add_argument("--worker-id", required=True)
+    parser.add_argument("--stage-id", default=STAGE_ID)
+    parser.add_argument("--experiment-id", default=EXPERIMENT_ID)
+    parser.add_argument("--run-id", default=RUN_ID)
+    parser.add_argument(
+        "--protocol-profile",
+        choices=(LEGACY_PROTOCOL_PROFILE, S3_PROTOCOL_PROFILE),
+        default=LEGACY_PROTOCOL_PROFILE,
+    )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--max-frames-total", type=int)
     parser.add_argument("--token-file", type=Path)
@@ -232,6 +244,14 @@ def _frame_input_hash(batch: dict, token: str) -> str:
 
 def main() -> int:
     args = parse_args()
+    if (
+        args.protocol_profile == S3_PROTOCOL_PROFILE
+        and args.mode == "s2b"
+        and args.condition in S3_HARD_BYPASS_CONDITIONS
+    ):
+        raise ValueError(
+            "Stage019-S3 complete-zero conditions require exact hard bypass, not S3-B search"
+        )
     source_root = Path(__file__).resolve().parents[2]
     output_dir = args.output_dir.resolve()
     artifact_root = args.artifact_root.resolve()
@@ -317,9 +337,10 @@ def main() -> int:
     }
     source_hashes, source_bundle_sha256 = _source_bundle(source_files)
     input_identity = {
-        "stage_id": STAGE_ID,
-        "experiment_id": EXPERIMENT_ID,
-        "run_id": RUN_ID,
+        "stage_id": args.stage_id,
+        "experiment_id": args.experiment_id,
+        "run_id": args.run_id,
+        "protocol_profile": args.protocol_profile,
         "mode": args.mode,
         "condition": args.condition,
         "scene_offset": args.scene_offset,

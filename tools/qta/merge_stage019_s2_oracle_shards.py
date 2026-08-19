@@ -64,6 +64,7 @@ def _locked_identity(identity: dict) -> dict:
         "stage_id",
         "experiment_id",
         "run_id",
+        "protocol_profile",
         "mode",
         "condition",
         "seed",
@@ -374,6 +375,18 @@ def main() -> int:
                 for key in ("mAP", "NDS")
             }
         }
+    prediction_outputs = {}
+    for role, payload in metrics.items():
+        candidates = [
+            record
+            for record in payload["evidence_files"]
+            if Path(record["path"]).name == "results_nusc.json"
+        ]
+        if len(candidates) != 1:
+            raise ValueError(
+                f"official evaluation did not expose one canonical prediction file for {role}"
+            )
+        prediction_outputs[role] = candidates[0]
     manifest = {
         "schema": "visfuse3d_stage019_s2_condition_merge_v1",
         "status": "complete_official_evaluation" if metrics else "complete_diagnostic_merge",
@@ -386,8 +399,10 @@ def main() -> int:
         "engineering_failure_count": 0,
         "diagnostic_counts": dict(diagnostic_counts),
         "accepted_count": accepted_count,
+        "protocol_profile": (locked or {}).get("protocol_profile"),
         "metrics": metrics,
         "delta": delta,
+        "prediction_outputs": prediction_outputs,
         "inputs": {
             "config": str(args.config.resolve()),
             "config_sha256": sha256_file(args.config),

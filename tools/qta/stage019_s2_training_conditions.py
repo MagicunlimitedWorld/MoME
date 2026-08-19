@@ -21,6 +21,17 @@ CONDITIONS = (
     "camera_zero",
     "camera_mud_mask",
 )
+S3_ACTIONABLE_CONDITIONS = (
+    "clean",
+    "beam_reduction_4",
+    "limited_fov_original_code_60",
+    "lidar_object_failure",
+    "camera_mud_mask",
+)
+S3_HARD_BYPASS_CONDITIONS = (
+    "lidar_zero",
+    "camera_zero",
+)
 OBJECT_FLAG_SALT = "mome-stage019-s2-training20-object-failure-v1"
 MUD_MASK_SALT = "mome-stage019-s2-training20-mud-mask-v1"
 

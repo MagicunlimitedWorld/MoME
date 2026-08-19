@@ -27,6 +27,14 @@ conditions_stub.CONDITIONS = (
     "camera_zero",
     "camera_mud_mask",
 )
+conditions_stub.S3_ACTIONABLE_CONDITIONS = (
+    "clean",
+    "beam_reduction_4",
+    "limited_fov_original_code_60",
+    "lidar_object_failure",
+    "camera_mud_mask",
+)
+conditions_stub.S3_HARD_BYPASS_CONDITIONS = ("lidar_zero", "camera_zero")
 previous_conditions_module = sys.modules.get("stage019_s2_training_conditions")
 sys.modules["stage019_s2_training_conditions"] = conditions_stub
 sys.path.insert(0, str(QTA_ROOT))
@@ -83,3 +91,24 @@ def test_three_observations_use_max_minus_min_envelope() -> None:
     assert aggregate.claim_boundary("four_repeat_v1").startswith(
         "observed_four_repeat_numerical_envelope"
     )
+
+
+def test_s3_profile_audits_only_actionable_conditions() -> None:
+    actionable, bypass = aggregate.protocol_conditions(
+        "stage019_s3_actionable_hard_bypass_v1"
+    )
+    assert actionable == conditions_stub.S3_ACTIONABLE_CONDITIONS
+    assert bypass == conditions_stub.S3_HARD_BYPASS_CONDITIONS
+    legacy, legacy_bypass = aggregate.protocol_conditions(
+        "stage019_s2_legacy_v1"
+    )
+    assert legacy == conditions_stub.CONDITIONS
+    assert legacy_bypass == ()
+
+
+def test_locked_repeat_manifest_hash_parser_is_fail_closed() -> None:
+    parsed = aggregate.expected_manifest_hashes(["gpu0_repeat0=" + "ab" * 32])
+    assert parsed == {"gpu0_repeat0": "AB" * 32}
+    for invalid in ("gpu0_repeat0", "gpu0_repeat0=xyz", "=a" * 32):
+        with pytest.raises(ValueError):
+            aggregate.expected_manifest_hashes([invalid])
