@@ -83,6 +83,20 @@ def protocol_conditions(profile: str) -> tuple[tuple[str, ...], tuple[str, ...]]
     return CONDITIONS, ()
 
 
+def query_margin_conditions(profile: str) -> tuple[str, ...]:
+    """Return conditions needing S2-A numerical envelopes.
+
+    S3 narrows only the S2-B proxy audit and search.  S2-A still reports all
+    seven conditions, so its keep/reconstruction envelopes must be derived
+    again from the locked raw repeats rather than copied from the failed S2
+    aggregate.
+    """
+
+    if profile not in PROTOCOL_PROFILES:
+        raise ValueError(f"unknown protocol profile: {profile}")
+    return CONDITIONS
+
+
 def expected_manifest_hashes(values: list[str]) -> dict[str, str]:
     output = {}
     for value in values:
@@ -253,6 +267,7 @@ def main() -> int:
     actionable_conditions, hard_bypass_conditions = protocol_conditions(
         args.protocol_profile
     )
+    s2a_conditions = query_margin_conditions(args.protocol_profile)
     expected_hashes = expected_manifest_hashes(
         args.expected_repeat_manifest_sha256
     )
@@ -336,7 +351,7 @@ def main() -> int:
             "original_mome": np.zeros(3, dtype=np.float64),
             "reconstruction": np.zeros(3, dtype=np.float64),
         }
-        for condition in actionable_conditions
+        for condition in s2a_conditions
     }
     proxy_overestimate = {
         condition: np.zeros(3, dtype=np.float64)
@@ -354,7 +369,7 @@ def main() -> int:
     frame_count_by_condition = {}
 
     # First pass locks paired numerical envelopes and proxy over-estimation.
-    for condition in actionable_conditions:
+    for condition in s2a_conditions:
         frame_sets = []
         for repeat_dir, _, _ in manifests:
             frame_sets.append(
@@ -410,6 +425,9 @@ def main() -> int:
                         ).max()
                     ),
                 )
+
+            if condition not in actionable_conditions:
+                continue
 
             canonical_index = next(
                 index for index, item in enumerate(manifests)
@@ -493,7 +511,8 @@ def main() -> int:
     calibration_claim_boundary = claim_boundary(args.repeat_profile)
     if args.protocol_profile == S3_PROTOCOL_PROFILE:
         calibration_claim_boundary += (
-            "_derived_from_locked_training_only_raw_repeats_for_actionable_conditions"
+            "_derived_from_locked_training_only_raw_repeats_"
+            "s2a_all_conditions_s2b_actionable_conditions_only"
         )
     applicability = {
         condition: {
@@ -517,6 +536,7 @@ def main() -> int:
         "protocol_profile": args.protocol_profile,
         "repeat_profile": args.repeat_profile,
         "repeat_ids": list(expected_ids),
+        "s2a_reporting_conditions": list(s2a_conditions),
         "actionable_conditions": list(actionable_conditions),
         "hard_bypass_conditions": list(hard_bypass_conditions),
         "condition_destination_applicability": applicability,
@@ -526,7 +546,7 @@ def main() -> int:
                 baseline: values.tolist()
                 for baseline, values in epsilon_query[condition].items()
             }
-            for condition in actionable_conditions
+            for condition in s2a_conditions
         },
         "proxy_overestimate": {
             condition: proxy_overestimate[condition].tolist()
@@ -546,6 +566,7 @@ def main() -> int:
         "protocol_profile": args.protocol_profile,
         "repeat_profile": args.repeat_profile,
         "expected_repeat_ids": list(expected_ids),
+        "s2a_reporting_conditions": list(s2a_conditions),
         "actionable_conditions": list(actionable_conditions),
         "hard_bypass_conditions": list(hard_bypass_conditions),
         "condition_destination_applicability": applicability,

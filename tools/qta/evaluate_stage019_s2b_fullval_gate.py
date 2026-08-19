@@ -145,6 +145,10 @@ def main() -> int:
         )
         and (
             not is_s3
+            or tuple(margins.get("s2a_reporting_conditions", ())) == CONDITIONS
+        )
+        and (
+            not is_s3
             or tuple(margins.get("hard_bypass_conditions", ()))
             == S3_HARD_BYPASS_CONDITIONS
         )

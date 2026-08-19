@@ -106,6 +106,12 @@ def test_s3_profile_audits_only_actionable_conditions() -> None:
     assert legacy_bypass == ()
 
 
+def test_s3_keeps_s2a_query_envelopes_for_all_seven_conditions() -> None:
+    assert aggregate.query_margin_conditions(
+        "stage019_s3_actionable_hard_bypass_v1"
+    ) == conditions_stub.CONDITIONS
+
+
 def test_locked_repeat_manifest_hash_parser_is_fail_closed() -> None:
     parsed = aggregate.expected_manifest_hashes(["gpu0_repeat0=" + "ab" * 32])
     assert parsed == {"gpu0_repeat0": "AB" * 32}

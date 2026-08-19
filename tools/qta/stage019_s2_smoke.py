@@ -26,6 +26,14 @@ try:
         _scene_dataset_indices,
     )
     from .route_snapshot_worker import recursive_sha256
+    from .stage019_s2_oracle_worker import (
+        _gpu_identity as _locked_gpu_identity,
+        _load_margins as _load_locked_margins,
+    )
+    from .stage019_s2_training_conditions import (
+        S3_ACTIONABLE_CONDITIONS,
+        S3_HARD_BYPASS_CONDITIONS,
+    )
 except ImportError:
     from common import atomic_write_json
     from extract_route_loss_cache import (
@@ -39,6 +47,14 @@ except ImportError:
     )
     from full_query_oracle_worker import _build_dataset_cfg, _scene_dataset_indices
     from route_snapshot_worker import recursive_sha256
+    from stage019_s2_oracle_worker import (
+        _gpu_identity as _locked_gpu_identity,
+        _load_margins as _load_locked_margins,
+    )
+    from stage019_s2_training_conditions import (
+        S3_ACTIONABLE_CONDITIONS,
+        S3_HARD_BYPASS_CONDITIONS,
+    )
 
 
 SUPPORTED_RUN_IDS = {
@@ -50,7 +66,11 @@ SUPPORTED_RUN_IDS = {
         "2026-08-18-mome-stage019-s2-r3-context-preserving-output-oracle-and-"
         "greedy-joint-gt-oracle-v1"
     ),
+    "2026-08-19-mome-stage019-s3-actionable-hard-bypass-v1",
 }
+LEGACY_PROTOCOL_PROFILE = "stage019_s2_legacy_v1"
+S3_PROTOCOL_PROFILE = "stage019_s3_actionable_hard_bypass_v1"
+S3_RUN_ID = "2026-08-19-mome-stage019-s3-actionable-hard-bypass-v1"
 
 
 def parse_args() -> argparse.Namespace:
@@ -66,15 +86,34 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mask-root", type=Path, required=True)
     parser.add_argument("--adapter-scripts", type=Path, required=True)
     parser.add_argument("--condition", default="clean")
+    parser.add_argument(
+        "--protocol-profile",
+        choices=(LEGACY_PROTOCOL_PROFILE, S3_PROTOCOL_PROFILE),
+        default=LEGACY_PROTOCOL_PROFILE,
+    )
+    parser.add_argument("--margins", type=Path)
     parser.add_argument("--training-clean", action="store_true")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--artifact-root", type=Path, required=True)
     parser.add_argument("--gpu-id", type=int, default=0)
+    parser.add_argument("--expected-cvd")
+    parser.add_argument("--expected-gpu-uuid")
+    parser.add_argument("--expected-gpu-pci")
+    parser.add_argument("--scene-offset", type=int, default=0)
     parser.add_argument("--seed", type=int, default=20260817)
     return parser.parse_args()
 
 
-def _gpu_identity() -> dict:
+def _gpu_identity(args: argparse.Namespace) -> dict:
+    expected = (
+        args.expected_cvd,
+        args.expected_gpu_uuid,
+        args.expected_gpu_pci,
+    )
+    if any(expected):
+        if not all(expected):
+            raise ValueError("locked GPU identity requires CVD, UUID, and PCI")
+        return _locked_gpu_identity(args)
     command = [
         "nvidia-smi",
         "--query-gpu=index,uuid,pci.bus_id,name,memory.total",
@@ -83,6 +122,56 @@ def _gpu_identity() -> dict:
     rows = subprocess.check_output(command, text=True).strip().splitlines()
     visible = os.environ.get("CUDA_VISIBLE_DEVICES")
     return {"cuda_visible_devices": visible, "nvidia_smi": rows}
+
+
+def _complete_query_permutations(result, torch) -> int:
+    identities = [result["query_identity"]["original_mome"][0]] + [
+        value[0] for value in result["query_identity"]["full_context_experts"]
+    ]
+    expected = torch.arange(900, device=identities[0].device)
+    for identity in identities:
+        if identity.shape != (900,) or not torch.equal(
+            torch.sort(identity.long()).values, expected
+        ):
+            raise RuntimeError("S3 smoke lost a complete 900-query permutation")
+    return len(identities)
+
+
+def _prediction_sha256(result: dict) -> str:
+    prediction = result["bbox_results"]["original_mome"][0]
+    boxes = prediction["boxes_3d"]
+    return recursive_sha256(
+        {
+            "boxes_3d": boxes.tensor.detach().cpu(),
+            "scores_3d": prediction["scores_3d"].detach().cpu(),
+            "labels_3d": prediction["labels_3d"].detach().cpu(),
+        }
+    )
+
+
+def _validate_s3_hard_bypass_input(
+    args: argparse.Namespace, batch: dict, torch
+) -> dict:
+    meta = batch["img_metas"][0]
+    if meta.get("qta_hard_bypass") is not True:
+        raise RuntimeError("complete-zero smoke input did not set qta_hard_bypass")
+    expected_routes = {
+        "lidar_zero": [False, False, True],
+        "camera_zero": [False, True, False],
+    }[args.condition]
+    if list(meta.get("qta_route_available", ())) != expected_routes:
+        raise RuntimeError("complete-zero route availability drifted")
+    if args.condition == "lidar_zero":
+        exact_zero = int(torch.count_nonzero(batch["points"][0]).item()) == 0
+    else:
+        exact_zero = int(torch.count_nonzero(batch["img"]).item()) == 0
+    if not exact_zero:
+        raise RuntimeError("complete-zero smoke input is not exactly zero")
+    return {
+        "qta_hard_bypass": True,
+        "qta_route_available": expected_routes,
+        "complete_modality_exact_zero": True,
+    }
 
 
 def _build_training_clean_dataset_cfg(cfg, args: argparse.Namespace):
@@ -120,6 +209,17 @@ def main() -> int:
     artifact_root = args.artifact_root.resolve()
     if artifact_root.name not in SUPPORTED_RUN_IDS:
         raise ValueError("artifact root does not match a locked Stage019-S2 run")
+    if (artifact_root.name == S3_RUN_ID) != (
+        args.protocol_profile == S3_PROTOCOL_PROFILE
+    ):
+        raise ValueError("smoke protocol profile does not match artifact run id")
+    if args.protocol_profile == S3_PROTOCOL_PROFILE and args.condition not in (
+        *S3_ACTIONABLE_CONDITIONS,
+        *S3_HARD_BYPASS_CONDITIONS,
+    ):
+        raise ValueError("condition is outside the locked S3 condition set")
+    if args.protocol_profile == S3_PROTOCOL_PROFILE and args.margins is None:
+        raise ValueError("S3 smoke requires locked margins")
     if not is_relative_to(output_dir, artifact_root):
         raise ValueError("output-dir must stay inside the S2 artifact root")
     if is_relative_to(output_dir, source_root):
@@ -180,7 +280,9 @@ def main() -> int:
             if sample_to_scene.get(str(info['token'])) == scene
         )
     else:
-        scene = str(scene_map["scene_tokens"][0])
+        if args.scene_offset < 0 or args.scene_offset >= len(scene_map["scene_tokens"]):
+            raise ValueError("scene-offset is outside the locked scene map")
+        scene = str(scene_map["scene_tokens"][args.scene_offset])
         grouped = _scene_dataset_indices(dataset, scene_map, [scene])
         dataset_index = grouped[scene][0]
 
@@ -215,6 +317,22 @@ def main() -> int:
             "img_shape": batch["img_metas"][0]["img_shape"],
         }
     )
+    hard_bypass_input = None
+    is_s3_hard_bypass = (
+        args.protocol_profile == S3_PROTOCOL_PROFILE
+        and args.condition in S3_HARD_BYPASS_CONDITIONS
+    )
+    if is_s3_hard_bypass:
+        hard_bypass_input = _validate_s3_hard_bypass_input(args, batch, torch)
+
+    if args.margins is not None:
+        args.mode = "s2a"
+        _, s2a_margins = _load_locked_margins(args)
+    else:
+        s2a_margins = {
+            "epsilon_query_keep": 0.0,
+            "epsilon_query_reconstruction": 0.0,
+        }
 
     original_extract = model.extract_feat
     extract_calls = {"s2a": 0, "s2b": 0}
@@ -232,31 +350,57 @@ def main() -> int:
             img=batch["img"],
             gt_bboxes_3d=batch["gt_bboxes_3d"],
             gt_labels_3d=batch["gt_labels_3d"],
-            epsilon_query_keep=0.0,
-            epsilon_query_reconstruction=0.0,
+            epsilon_query_keep=s2a_margins["epsilon_query_keep"],
+            epsilon_query_reconstruction=s2a_margins[
+                "epsilon_query_reconstruction"
+            ],
             return_predictions=True,
         )
-        active["name"] = "s2b"
-        s2b = model.forward_qta_greedy_joint_oracle(
-            points=batch["points"],
-            img_metas=batch["img_metas"],
-            img=batch["img"],
-            gt_bboxes_3d=batch["gt_bboxes_3d"],
-            gt_labels_3d=batch["gt_labels_3d"],
-            epsilon_query=0.0,
-            proxy_overestimate=0.0,
-            epsilon_frame=0.0,
-            candidate_k=4,
-            return_predictions=True,
-        )
-    if extract_calls != {"s2a": 1, "s2b": 1}:
+        s2b = None
+        if not is_s3_hard_bypass:
+            active["name"] = "s2b"
+            if args.margins is not None:
+                args.mode = "s2b"
+                _, s2b_margins = _load_locked_margins(args)
+            else:
+                s2b_margins = {
+                    "epsilon_query_reconstruction": 0.0,
+                    "proxy_overestimate": 0.0,
+                    "epsilon_frame": 0.0,
+                    "K": 4,
+                }
+            s2b = model.forward_qta_greedy_joint_oracle(
+                points=batch["points"],
+                img_metas=batch["img_metas"],
+                img=batch["img"],
+                gt_bboxes_3d=batch["gt_bboxes_3d"],
+                gt_labels_3d=batch["gt_labels_3d"],
+                epsilon_query=s2b_margins["epsilon_query_reconstruction"],
+                proxy_overestimate=s2b_margins["proxy_overestimate"],
+                epsilon_frame=s2b_margins["epsilon_frame"],
+                candidate_k=s2b_margins["K"],
+                return_predictions=True,
+            )
+    expected_extract_calls = {
+        "s2a": 1,
+        "s2b": 0 if is_s3_hard_bypass else 1,
+    }
+    if extract_calls != expected_extract_calls:
         raise RuntimeError(f"backbone call invariant failed: {extract_calls}")
     if int(s2a["decoder_call_count"]) != 4:
         raise RuntimeError("S2-A must use exactly four decoder executions")
-    if int(s2b["decoder_call_count"]) > 8:
-        raise RuntimeError("S2-B exceeded 4+K decoder executions")
     if not s2a["all_keep_tensor_exact"] or not s2a["all_keep_bbox_exact"]:
         raise RuntimeError("all-KEEP identity audit failed")
+    query_permutation_count = _complete_query_permutations(s2a, torch)
+    if s2b is not None:
+        if int(s2b["decoder_call_count"]) > int(s2b["decoder_call_limit"]):
+            raise RuntimeError("S2-B exceeded 4+K decoder executions")
+        final_query_indices = s2b["final_query_indices"][0].long()
+        if final_query_indices.shape != (900,) or not torch.equal(
+            torch.sort(final_query_indices).values,
+            torch.arange(900, device=final_query_indices.device),
+        ):
+            raise RuntimeError("S2-B lost its complete 900-query permutation")
 
     source_files = {
         "detector": source_root
@@ -267,9 +411,14 @@ def main() -> int:
         "smoke": Path(__file__).resolve(),
     }
     manifest = {
-        "schema": "visfuse3d_stage019_s2_smoke_manifest_v1",
+        "schema": (
+            "visfuse3d_stage019_s3_smoke_manifest_v1"
+            if args.protocol_profile == S3_PROTOCOL_PROFILE
+            else "visfuse3d_stage019_s2_smoke_manifest_v1"
+        ),
         "status": "passed",
         "run_id": artifact_root.name,
+        "protocol_profile": args.protocol_profile,
         "condition": args.condition,
         "training_clean": bool(args.training_clean),
         "scene_token": scene,
@@ -285,7 +434,7 @@ def main() -> int:
             sha256_file(args.scene_list_manifest)
             if args.scene_list_manifest else None
         ),
-        "gpu_identity": _gpu_identity(),
+        "gpu_identity": _gpu_identity(args),
         "trainable_parameter_count": trainable,
         "source_hashes": {
             name: sha256_file(path) for name, path in source_files.items()
@@ -302,17 +451,34 @@ def main() -> int:
             "all_keep_tensor_exact": bool(s2a["all_keep_tensor_exact"]),
             "all_keep_bbox_exact": bool(s2a["all_keep_bbox_exact"]),
             "output_names": sorted(s2a["bbox_results"]),
+            "query_count": 900,
+            "complete_query_permutation_count": query_permutation_count,
         },
-        "s2b": {
+    }
+    if s2b is not None:
+        manifest["s2b"] = {
+            "applicability": "actionable_search",
             "K": int(s2b["K"]),
             "backbone_calls": extract_calls["s2b"],
             "decoder_calls": int(s2b["decoder_call_count"]),
+            "decoder_call_limit": int(s2b["decoder_call_limit"]),
             "candidate_count": len(s2b["candidate_order"]),
             "accepted_count": int(s2b["accepted_count"]),
             "base_route_hash": s2b["base_route_hash"],
             "final_route_hash": s2b["final_route_hash"],
-        },
-    }
+            "query_count": 900,
+            "complete_query_permutation": True,
+        }
+    else:
+        prediction_sha256 = _prediction_sha256(s2a)
+        manifest["s2b"] = {
+            "applicability": "hard_bypass_not_applicable",
+            "search_executed": False,
+            "input_identity": hard_bypass_input,
+            "base_prediction_sha256": prediction_sha256,
+            "final_prediction_sha256": prediction_sha256,
+            "prediction_sha256_identical": True,
+        }
     atomic_write_json(output_dir / "s2_smoke_manifest.json", manifest)
     print(json.dumps(manifest, indent=2, sort_keys=True))
     return 0

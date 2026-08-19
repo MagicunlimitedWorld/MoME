@@ -166,12 +166,22 @@ def _load_margins(args: argparse.Namespace) -> tuple[dict, dict]:
     try:
         keep = payload["epsilon_num_query"][condition]["original_mome"]
         reconstruction = payload["epsilon_num_query"][condition]["reconstruction"]
-        proxy = payload["proxy_overestimate"][condition]
-        frame = payload["epsilon_num_frame"][condition]
     except KeyError as exc:
         raise ValueError(f"calibration margins lack {condition}: {exc}") from exc
-    if any(len(value) != 3 for value in (keep, reconstruction, proxy)):
-        raise ValueError("query/proxy margins must contain three destinations")
+    if any(len(value) != 3 for value in (keep, reconstruction)):
+        raise ValueError("query margins must contain three destinations")
+    proxy = [0.0, 0.0, 0.0]
+    frame = 0.0
+    if args.mode == "s2b":
+        try:
+            proxy = payload["proxy_overestimate"][condition]
+            frame = payload["epsilon_num_frame"][condition]
+        except KeyError as exc:
+            raise ValueError(
+                f"S2-B calibration margins lack actionable condition {condition}: {exc}"
+            ) from exc
+        if len(proxy) != 3:
+            raise ValueError("proxy margins must contain three destinations")
     numeric = np.asarray(keep + reconstruction + proxy + [frame], dtype=np.float64)
     if not np.isfinite(numeric).all() or np.any(numeric < 0):
         raise ValueError("calibration margins must be finite and non-negative")
