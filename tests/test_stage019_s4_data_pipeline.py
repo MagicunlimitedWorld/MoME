@@ -21,6 +21,7 @@ try:
     import stage019_s4_object_cache as cache
     import stage019_s4_oracles as oracles
     import stage019_s4_training_common as training
+    import stage019_s4_validation_gate as validation_gate
 finally:
     sys.path.pop(0)
 
@@ -387,6 +388,103 @@ def test_validation_gate_requires_both_changed_and_accepted_and_real_zero_sha(
         deltas, 1, 1, zero, "gace_lite"
     )
     assert not tampered["passed"]
+
+
+def test_stacked_g1_authority_is_same_seed_for_calibration_and_primary_afterward(
+    tmp_path: Path,
+) -> None:
+    primary_sha = "1" * 64
+    confirmation_sha = "2" * 64
+
+    def write_g1_gate(name: str, seed_role: str, checkpoint_sha: str) -> Path:
+        path = tmp_path / f"{name}.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "schema": "visfuse3d_stage019_s4_validation_gate_manifest_v1",
+                    "phase": "calibration",
+                    "seed_role": seed_role,
+                    "passed": True,
+                    "g1_strength_selection": {"selected_strength": 0.5},
+                    "candidate_eval_identity": {
+                        "head_checkpoint": {"sha256": checkpoint_sha}
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        return path
+
+    def selected_with_parent(name: str, checkpoint_sha: str) -> dict:
+        checkpoint = tmp_path / f"{name}.pth"
+        torch.save(
+            {"parent_gace_checkpoint": {"sha256": checkpoint_sha}}, checkpoint
+        )
+        return {
+            "clean": {
+                "locked_eval_identity": {
+                    "mode": "stacked",
+                    "fusion_strength": 0.5,
+                    "head_checkpoint": {"path": str(checkpoint)},
+                }
+            }
+        }
+
+    primary_gate = write_g1_gate("primary", "primary", primary_sha)
+    confirmation_gate = write_g1_gate(
+        "confirmation", "confirmation", confirmation_sha
+    )
+    primary_selected = selected_with_parent("cp_primary", primary_sha)
+    confirmation_selected = selected_with_parent("cp_confirmation", confirmation_sha)
+
+    primary_args = Namespace(
+        phase="calibration",
+        seed_role="primary",
+        g1_gate=primary_gate,
+        selected_strength=0.5,
+    )
+    assert (
+        validation_gate._validate_stacked_g1_authority(
+            primary_args, primary_selected
+        )
+        == 0.5
+    )
+    confirmation_args = Namespace(
+        phase="calibration",
+        seed_role="confirmation",
+        g1_gate=confirmation_gate,
+        selected_strength=0.5,
+    )
+    assert (
+        validation_gate._validate_stacked_g1_authority(
+            confirmation_args, confirmation_selected
+        )
+        == 0.5
+    )
+    confirmation_args.g1_gate = primary_gate
+    with pytest.raises(ValueError, match="authority mismatch"):
+        validation_gate._validate_stacked_g1_authority(
+            confirmation_args, confirmation_selected
+        )
+
+    for phase in ("pilot", "fullval"):
+        validation_args = Namespace(
+            phase=phase,
+            seed_role="confirmation",
+            g1_gate=primary_gate,
+            selected_strength=0.5,
+        )
+        assert (
+            validation_gate._validate_stacked_g1_authority(
+                validation_args, primary_selected
+            )
+            == 0.5
+        )
+        validation_args.g1_gate = confirmation_gate
+        with pytest.raises(ValueError, match="authority mismatch"):
+            validation_gate._validate_stacked_g1_authority(
+                validation_args, confirmation_selected
+            )
 
 
 def test_provenance_call_precedes_every_optimizer_step_in_trainers() -> None:

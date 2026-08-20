@@ -192,6 +192,44 @@ def _checkpoint_seed(payload: dict) -> int:
     return int(raw.get("seed", -1))
 
 
+def _validate_stacked_g1_authority(args: argparse.Namespace, selected: dict) -> float:
+    if args.g1_gate is None or args.selected_strength is None:
+        raise ValueError("stacked CP-AFR requires a locked G1 gate/strength")
+    g1_gate = json.loads(args.g1_gate.read_text(encoding="utf-8"))
+    locked_strength = g1_gate.get("g1_strength_selection", {}).get(
+        "selected_strength"
+    )
+    expected_seed_role = args.seed_role if args.phase == "calibration" else "primary"
+    if (
+        g1_gate.get("schema")
+        != "visfuse3d_stage019_s4_validation_gate_manifest_v1"
+        or g1_gate.get("phase") != "calibration"
+        or g1_gate.get("seed_role") != expected_seed_role
+        or not bool(g1_gate.get("passed"))
+        or locked_strength is None
+        or float(locked_strength) != float(args.selected_strength)
+    ):
+        raise ValueError("stacked CP-AFR G1 calibration authority mismatch")
+    observed_strengths = {
+        float((payload.get("locked_eval_identity") or {}).get("fusion_strength", -1.0))
+        for payload in selected.values()
+    }
+    if observed_strengths != {float(locked_strength)}:
+        raise ValueError("stacked CP-AFR used a different G1 strength")
+    cp_identity = next(iter(selected.values()))["locked_eval_identity"]
+    cp_path = Path(cp_identity["head_checkpoint"]["path"])
+    import torch
+
+    cp_payload = torch.load(str(cp_path), map_location="cpu")
+    parent_gace = cp_payload.get("parent_gace_checkpoint") or {}
+    locked_gace = g1_gate.get("candidate_eval_identity", {}).get(
+        "head_checkpoint", {}
+    )
+    if not parent_gace or parent_gace.get("sha256") != locked_gace.get("sha256"):
+        raise ValueError("stacked CP-AFR parent differs from passed G1 checkpoint")
+    return float(locked_strength)
+
+
 def main() -> int:
     args = parse_args()
     output_dir = args.output_dir.resolve()
@@ -252,42 +290,7 @@ def main() -> int:
                 for payload in selected.values()
             }
             if observed_modes == {"stacked"}:
-                if args.g1_gate is None or args.selected_strength is None:
-                    raise ValueError("stacked CP-AFR requires the locked primary G1 gate/strength")
-                g1_gate = json.loads(args.g1_gate.read_text(encoding="utf-8"))
-                locked_strength = (
-                    g1_gate.get("g1_strength_selection", {}).get("selected_strength")
-                )
-                if (
-                    g1_gate.get("schema")
-                    != "visfuse3d_stage019_s4_validation_gate_manifest_v1"
-                    or g1_gate.get("phase") != "calibration"
-                    or g1_gate.get("seed_role") != "primary"
-                    or not bool(g1_gate.get("passed"))
-                    or locked_strength is None
-                    or float(locked_strength) != float(args.selected_strength)
-                ):
-                    raise ValueError("stacked CP-AFR G1 calibration authority mismatch")
-                observed_strengths = {
-                    float((payload.get("locked_eval_identity") or {}).get("fusion_strength", -1.0))
-                    for payload in selected.values()
-                }
-                if observed_strengths != {float(locked_strength)}:
-                    raise ValueError("stacked CP-AFR used a different G1 strength")
-                cp_identity = next(iter(selected.values()))["locked_eval_identity"]
-                cp_path = Path(cp_identity["head_checkpoint"]["path"])
-                import torch
-
-                cp_payload = torch.load(str(cp_path), map_location="cpu")
-                parent_gace = cp_payload.get("parent_gace_checkpoint") or {}
-                locked_gace = (
-                    g1_gate.get("candidate_eval_identity", {}).get("head_checkpoint", {})
-                )
-                if (
-                    not parent_gace
-                    or parent_gace.get("sha256") != locked_gace.get("sha256")
-                ):
-                    raise ValueError("stacked CP-AFR parent differs from passed G1 checkpoint")
+                _validate_stacked_g1_authority(args, selected)
             elif observed_modes == {"attribute_only"}:
                 if args.g1_gate is not None or args.selected_strength is not None:
                     raise ValueError("attribute-only CP-AFR must stay on raw scores")
