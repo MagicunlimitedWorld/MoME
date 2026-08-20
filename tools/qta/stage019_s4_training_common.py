@@ -10,7 +10,7 @@ import random
 import tempfile
 import csv
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Union
 
 import numpy as np
 import torch
@@ -35,6 +35,25 @@ except ImportError:
         PROTOCOL_PROFILE,
         sha256_file,
     )
+
+
+DETERMINISTIC_CUBLAS_WORKSPACE_CONFIG = ":4096:8"
+
+
+def resolve_deterministic_training_device(
+    value: Union[str, torch.device]
+) -> torch.device:
+    """Resolve the device and fail closed before any CUDA training work."""
+    device = torch.device(value)
+    if device.type == "cuda":
+        observed = os.environ.get("CUBLAS_WORKSPACE_CONFIG")
+        if observed != DETERMINISTIC_CUBLAS_WORKSPACE_CONFIG:
+            raise RuntimeError(
+                "S4 CUDA training requires CUBLAS_WORKSPACE_CONFIG="
+                f"{DETERMINISTIC_CUBLAS_WORKSPACE_CONFIG} before launching Python; "
+                f"observed {observed!r}"
+            )
+    return device
 
 
 def formal_module_path() -> Path:
@@ -367,6 +386,9 @@ def write_optimizer_provenance(
     if trainable_count != total_trainable or total_trainable <= 0:
         raise RuntimeError("S4 trainable parameter-name closure drifted")
     validate_trainable_parameter_count(total_trainable)
+    model_device = resolve_deterministic_training_device(
+        next(model.parameters()).device
+    )
     manifest = {
         "schema": "visfuse3d_stage019_s4_optimizer_provenance_v1",
         "status": "locked_before_first_optimizer_step",
@@ -437,8 +459,9 @@ def write_optimizer_provenance(
         },
         "loss": dict(loss_contract),
         "hardware": {
-            "device": str(next(model.parameters()).device),
+            "device": str(model_device),
             "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+            "cublas_workspace_config": os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
             "torch_version": torch.__version__,
             "cuda_version": torch.version.cuda,
         },

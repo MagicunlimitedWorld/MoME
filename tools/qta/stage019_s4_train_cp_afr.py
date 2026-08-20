@@ -26,6 +26,7 @@ try:
         load_formal_fusion_module,
         load_fusion_checkpoint,
         mean_condition_loss,
+        resolve_deterministic_training_device,
         resolve_training_cache_authority,
         set_seed,
         state_dict_sha256,
@@ -45,6 +46,7 @@ except ImportError:
         load_formal_fusion_module,
         load_fusion_checkpoint,
         mean_condition_loss,
+        resolve_deterministic_training_device,
         resolve_training_cache_authority,
         set_seed,
         state_dict_sha256,
@@ -162,6 +164,7 @@ def main() -> int:
         raise ValueError("CP-AFR output cannot enter source checkout")
     if output_dir.exists():
         raise FileExistsError(f"immutable CP-AFR output exists: {output_dir}")
+    device = resolve_deterministic_training_device(args.device)
     if sha256_file(args.frozen_checkpoint) != EXPECTED_MOME_CHECKPOINT_SHA256:
         raise ValueError("CP-AFR frozen MoME checkpoint SHA256 mismatch")
     if (args.mode == "stacked") != (args.gace_checkpoint is not None):
@@ -180,7 +183,6 @@ def main() -> int:
     fit = load_cache_arrays(fit_paths, REQUIRED_KEYS)
     calibration = load_cache_arrays(calibration_paths, REQUIRED_KEYS)
     set_seed(args.seed)
-    device = torch.device(args.device)
     formal = load_formal_fusion_module()
     module = formal.ObjectSetAttributeFusion().to(device)
     parent_gace = None

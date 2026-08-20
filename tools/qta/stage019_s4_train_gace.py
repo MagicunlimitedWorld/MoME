@@ -24,6 +24,7 @@ try:
         load_cache_arrays,
         load_formal_fusion_module,
         mean_condition_loss,
+        resolve_deterministic_training_device,
         resolve_training_cache_authority,
         set_seed,
         state_dict_sha256,
@@ -42,6 +43,7 @@ except ImportError:
         load_cache_arrays,
         load_formal_fusion_module,
         mean_condition_loss,
+        resolve_deterministic_training_device,
         resolve_training_cache_authority,
         set_seed,
         state_dict_sha256,
@@ -102,6 +104,7 @@ def main() -> int:
         raise ValueError("GACE output cannot enter source checkout")
     if output_dir.exists():
         raise FileExistsError(f"immutable GACE output exists: {output_dir}")
+    device = resolve_deterministic_training_device(args.device)
     if sha256_file(args.frozen_checkpoint) != EXPECTED_MOME_CHECKPOINT_SHA256:
         raise ValueError("GACE frozen MoME checkpoint SHA256 mismatch")
     gate = json.loads(args.g0_gate.read_text(encoding="utf-8"))
@@ -117,7 +120,6 @@ def main() -> int:
     )
     fit = load_cache_arrays(fit_paths, REQUIRED_KEYS)
     calibration = load_cache_arrays(calibration_paths, REQUIRED_KEYS)
-    device = torch.device(args.device)
     formal = load_formal_fusion_module()
     output_dir.mkdir(parents=True)
 

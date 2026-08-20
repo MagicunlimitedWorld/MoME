@@ -490,6 +490,58 @@ def test_stacked_g1_authority_is_same_seed_for_calibration_and_primary_afterward
 def test_provenance_call_precedes_every_optimizer_step_in_trainers() -> None:
     for name in ("stage019_s4_train_gace.py", "stage019_s4_train_cp_afr.py"):
         source = (QTA / name).read_text(encoding="utf-8")
+        device_check = source.index(
+            "device = resolve_deterministic_training_device(args.device)"
+        )
         first_provenance = source.index("write_optimizer_provenance(")
         first_step = source.index("optimizer.step()")
+        assert device_check < source.index("set_seed(")
+        assert device_check < source.index(".to(device)")
+        assert device_check < source.index("output_dir.mkdir")
         assert first_provenance < first_step
+
+
+def test_deterministic_training_device_environment_is_fail_closed(monkeypatch) -> None:
+    monkeypatch.delenv("CUBLAS_WORKSPACE_CONFIG", raising=False)
+    assert training.resolve_deterministic_training_device("cpu") == torch.device("cpu")
+    with pytest.raises(RuntimeError, match="CUBLAS_WORKSPACE_CONFIG"):
+        training.resolve_deterministic_training_device("cuda:0")
+
+    monkeypatch.setenv("CUBLAS_WORKSPACE_CONFIG", ":16:8")
+    with pytest.raises(RuntimeError, match=":4096:8"):
+        training.resolve_deterministic_training_device("cuda:0")
+
+    monkeypatch.setenv("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    assert training.resolve_deterministic_training_device("cuda:0") == torch.device(
+        "cuda:0"
+    )
+
+
+def test_optimizer_provenance_records_cublas_workspace_config(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    model = torch.nn.Linear(2, 1)
+    optimizer = torch.optim.AdamW(model.parameters())
+    inputs = {}
+    for name in ("fit", "calibration", "checkpoint", "trainer", "config", "gate"):
+        path = tmp_path / f"{name}.bin"
+        path.write_bytes(name.encode("utf-8"))
+        inputs[name] = path
+    manifest = training.write_optimizer_provenance(
+        tmp_path,
+        method="gace_lite",
+        seed=contracts.PRIMARY_SEED,
+        fit_paths={"clean": [inputs["fit"]]},
+        calibration_paths={"clean": [inputs["calibration"]]},
+        model=model,
+        optimizer=optimizer,
+        loss_contract={"type": "test"},
+        frozen_checkpoint=inputs["checkpoint"],
+        trainable_names=[name for name, _ in model.named_parameters()],
+        batch_size=1,
+        trainer_path=inputs["trainer"],
+        config_path=inputs["config"],
+        authority_manifests={"g0_gate": inputs["gate"]},
+    )
+    assert manifest["hardware"]["cublas_workspace_config"] == ":4096:8"
